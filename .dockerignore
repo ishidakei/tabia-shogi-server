@@ -1,0 +1,17 @@
+# The build context, as an allow-list: exclude everything, then put back the
+# few paths the release build in Dockerfile actually reads.
+#
+# This way round on purpose. A deny-list grows a hole every time a directory
+# appears at the root of the tree — the new one is in the context until someone
+# remembers to add it — while an allow-list fails closed: a path nobody named
+# is simply not shipped to the daemon.
+*
+
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+
+# The directory and everything under it. Both lines, so that the walk descends
+# into it whichever way the matcher reads a bare directory name.
+!src
+!src/**

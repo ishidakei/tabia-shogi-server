@@ -1,0 +1,22 @@
+auth_mode = "open"
+positions = "assets/positions/m2-gate.txt"
+
+[limit]
+max_moves = 512
+min_playable_plies = 40
+
+[matchmaking]
+idle_delay_seconds = 0
+interval_seconds = 1
+
+[server]
+listen = "0.0.0.0:4081"
+max_malformed_lines = 8
+agreement_timeout_seconds = 120
+
+[time]
+time_unit = "1sec"
+total = 600
+increment = 10
+least_time_per_move = 0
+roundup = false

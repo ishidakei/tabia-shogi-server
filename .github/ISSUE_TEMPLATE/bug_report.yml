@@ -1,0 +1,37 @@
+name: Bug report
+description: The server did something other than what it should have done.
+title: "bug: "
+body:
+  - type: input
+    id: client
+    attributes:
+      label: Client software used
+      description: The engine, bridge, or tool that was connected, and its version.
+      placeholder: "for example: a USI-to-CSA bridge, version 1.2.3"
+    validations:
+      required: true
+  - type: textarea
+    id: telegrams
+    attributes:
+      label: Telegram log
+      description: >
+        The CSA telegrams exchanged, if you have them, from LOGIN to the
+        termination. Paste them as text rather than as a screenshot. A log is
+        worth more than a description of one.
+      render: text
+    validations:
+      required: false
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What should the server have done, and what makes you say so?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: What did the server do instead? Include the exact response if there was one.
+    validations:
+      required: true
