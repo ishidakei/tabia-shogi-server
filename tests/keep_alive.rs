@@ -1,13 +1,11 @@
 //! The keep-alive, over real sockets: what each blank line is answered with,
 //! and that none of them is a malformed line.
 //!
-//! `Command::parse("")` used to return an unknown line, so a client using the
-//! empty line as a keep-alive — which shogi-server documents as an
-//! application-level protocol and answers with an LF — spent one of its
-//! `[server].max_malformed_lines` on every one and was disconnected on the
-//! eighth. Every test here therefore runs with **`max_malformed_lines = 1`**:
-//! one counted line closes the connection, so a keep-alive that was counted
-//! could not be answered twice.
+//! shogi-server documents the empty line as an application-level keep-alive and
+//! answers it with an LF, so a client that uses it must not spend one of its
+//! `[csa].max_malformed_lines` on every one. Every test here runs with
+//! `max_malformed_lines = 1`, so a keep-alive that was counted could not be
+//! answered twice.
 //!
 //! The table these assert is the reference's (`shogi_server/command.rb`,
 //! `Command.factory` and `SpecialCommand#call`):
@@ -26,6 +24,7 @@ use tokio::time::sleep;
 
 use common::{Client, config_text, config_text_with_time, one_game, seated, start, start_game};
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn empty_lines_in_a_game_are_answered_with_empty_lines_and_never_counted() {
     let server = start(&config_text(1, 1), common::HIRATE).await;
@@ -58,6 +57,7 @@ async fn empty_lines_in_a_game_are_answered_with_empty_lines_and_never_counted()
     }
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_single_space_is_answered_by_nothing() {
     let server = start(&config_text(1, 1), common::HIRATE).await;
@@ -77,6 +77,7 @@ async fn a_single_space_is_answered_by_nothing() {
     game.black.expect("-3334FU,T1").await;
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_longer_whitespace_line_is_answered_by_nothing_either() {
     let server = start(&config_text(1, 1), common::HIRATE).await;
@@ -92,11 +93,12 @@ async fn a_longer_whitespace_line_is_answered_by_nothing_either() {
     game.white.expect("+7776FU,T1").await;
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_comment_only_line_is_the_empty_line() {
-    // After #82's split a line that is nothing but a comment leaves the empty
-    // command, so it is a keep-alive by inheritance rather than by a rule of
-    // its own — including the form with the separator comma still on it.
+    // A line that is nothing but a comment leaves the empty command, so it is a
+    // keep-alive by inheritance rather than by a rule of its own — including the
+    // form with the separator comma still on it.
     let server = start(&config_text(1, 1), common::HIRATE).await;
     let mut game = one_game(&server).await;
 
@@ -109,11 +111,12 @@ async fn a_comment_only_line_is_the_empty_line() {
     game.black.expect("+7776FU,T1").await;
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_keep_alive_is_answered_before_a_login_and_while_waiting() {
     // The reference classifies the keep-alive in `Command.factory`, ahead of
     // every status test, and `SessionState::route` is one function over all five
-    // states — so `Connected` and `Waiting` answer it exactly as `Playing` does.
+    // states.
     let server = start(&config_text(1, 1), common::HIRATE).await;
 
     let mut client = Client::connect(server.local_addr()).await;
@@ -135,12 +138,12 @@ async fn a_keep_alive_is_answered_before_a_login_and_while_waiting() {
     client.expect_closed().await;
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_keep_alive_while_agreeing_leaves_the_pairing_alone() {
     // `Agreeing` is the other state with a deadline, and the keep-alive runs the
     // agreement window's expiry check there. The window is the default two
-    // minutes, so nothing expires: what is asserted is that the pairing survives
-    // the line and both agreements still start the game.
+    // minutes, so nothing expires.
     let server = start(&config_text(1, 1), common::HIRATE).await;
     let seats = seated(&server, ["engine-a", "engine-b"]).await;
 
@@ -159,23 +162,23 @@ async fn a_keep_alive_while_agreeing_leaves_the_pairing_alone() {
     game.white.expect("+7776FU,T1").await;
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_keep_alive_after_the_flag_has_fallen_sees_the_time_up() {
     // Four hundred milliseconds for the whole game, and Black never moves.
     //
-    // What produces the `#TIME_UP` here is this server's own armed deadline
-    // (P-5, "a silent player flags too"), which the reference does not have —
-    // so over sockets the keep-alive cannot be shown to be what flagged. That it
-    // *would* flag on its own is asserted where it can be isolated, in
-    // `session::pairing`'s `a_keep_alive_past_the_allowance_flags_the_side_to_move`,
-    // with no timer running at all. What this test adds is the end of the wire:
-    // a keep-alive sent after the flag fell finds the termination waiting for
-    // it, and is itself still answered rather than counted.
+    // What produces the `#TIME_UP` here is the server's own armed deadline, so
+    // over sockets the keep-alive cannot be shown to be what flagged; that it
+    // would is asserted in `session::pairing`'s
+    // `a_keep_alive_past_the_allowance_flags_the_side_to_move`. What this adds
+    // is that a keep-alive sent after the flag fell finds the termination
+    // waiting for it and is still answered rather than counted.
     let server = start(
         &config_text_with_time(
             "\
 time_unit = \"1msec\"
 total = 400
+increment = 0
 least_time_per_move = 0
 roundup = false",
         ),

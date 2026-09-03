@@ -1,0 +1,38 @@
+{% extends "layout.html" %}
+
+{% block title %}{{ game.game_id() }} — tabia-shogi-server{% endblock %}
+
+{% block content %}
+<h2>{{ game.game_id() }}</h2>
+<dl>
+<dt>先手</dt><dd>{{ game.black_name() }}</dd>
+<dt>後手</dt><dd>{{ game.white_name() }}</dd>
+<dt>開始 (UTC)</dt><dd>{{ game.started_at() }}</dd>
+<dt>終局 (UTC)</dt><dd>{{ game.ended_at() }}</dd>
+<dt>結果</dt>
+<dd>
+{%- if game.result() == "black" -%}先手勝ち
+{%- else if game.result() == "white" -%}後手勝ち
+{%- else if game.result() == "draw" -%}引き分け
+{%- else -%}勝者なし
+{%- endif -%}
+</dd>
+<dt>終局理由</dt><dd>{{ game.end_status_label() }}</dd>
+<dt>手数</dt><dd>{{ game.ply_count() }}</dd>
+<dt>開始局面</dt>
+<dd>
+{%- if game.start_category() == "hirate" -%}平手の初形
+{%- else if game.start_category() == "designated" -%}平手の初形から手順あり
+{%- else -%}盤面を直接書いた初形
+{%- endif -%}
+</dd>
+<dt>持ち時間</dt>
+<dd>
+{%- if game.time_category() == "symmetric" -%}両者同じ
+{%- else -%}非対称
+{%- endif -%}
+</dd>
+</dl>
+
+<p><a href="/games/{{ game.game_id() }}/record">棋譜 (CSA)</a></p>
+{% endblock %}

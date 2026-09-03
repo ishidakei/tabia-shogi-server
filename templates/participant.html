@@ -1,0 +1,67 @@
+{% extends "layout.html" %}
+
+{% block title %}{{ participant.display_name() }} — tabia-shogi-server{% endblock %}
+
+{% block content %}
+<h2>{{ participant.display_name() }}</h2>
+
+<dl>
+<dt>レーティング</dt>
+<dd>
+{%- if let Some(rating) = participant.rating() -%}{{ rating }}
+{%- else -%}<span class="muted">未算定</span>
+{%- endif -%}
+</dd>
+<dt>対局数</dt><dd>{{ participant.games_played() }}</dd>
+<dt>最終対局 (UTC)</dt><dd>{{ participant.last_ended_at() }}</dd>
+<dt>参加者 ID</dt><dd class="hand">{{ participant.token_key() }}</dd>
+</dl>
+
+<p class="muted">
+参加者 ID は、対局に使われたトークンのハッシュです。トークンそのものではありません。
+</p>
+
+{% if let Some(identity) = participant.identity() %}
+<h2>GitHub アカウント</h2>
+<dl>
+<dt>アカウント名</dt><dd>{{ identity.account_name() }}</dd>
+<dt>ユーザー ID</dt><dd>{{ identity.account_id() }}</dd>
+<dt>アバター画像の URL</dt><dd>{{ identity.avatar_url() }}</dd>
+</dl>
+<p class="muted">この欄が出るのは、この参加者の持ち主が GitHub のアカウントを公開すると選んだ場合だけです。公開は 3 つまとめてなので、出るときは 3 つとも出ます。</p>
+{% endif %}
+
+<h2>対局</h2>
+{% if participant.games().is_empty() %}
+<p class="muted">この範囲に対局はありません。</p>
+{% else %}
+<table>
+<thead>
+<tr><th>開始 (UTC)</th><th>先手</th><th>後手</th><th>結果</th><th>終局</th><th>手数</th><th>棋譜</th></tr>
+</thead>
+<tbody>
+{% for game in participant.games() %}
+<tr>
+<td><a href="/games/{{ game.game_id() }}">{{ game.started_at() }}</a></td>
+<td>{{ game.black_name() }}</td>
+<td>{{ game.white_name() }}</td>
+<td>
+{%- if game.result() == "black" -%}先手勝ち
+{%- else if game.result() == "white" -%}後手勝ち
+{%- else if game.result() == "draw" -%}引き分け
+{%- else -%}勝者なし
+{%- endif -%}
+</td>
+<td>{{ game.end_status_label() }}</td>
+<td>{{ game.ply_count() }}</td>
+<td><a href="/games/{{ game.game_id() }}/record">CSA</a></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+
+{% if let Some(cursor) = participant.older() %}
+<p><a href="/participants/{{ participant.token_key() }}?before={{ cursor|urlencode }}">これより前の対局</a></p>
+{% endif %}
+{% endblock %}

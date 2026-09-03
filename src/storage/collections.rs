@@ -1,43 +1,31 @@
 //! Position collections: the plain-text USI file an operator edits, loaded and
 //! validated entry by entry.
 //!
-//! A collection is **data, not configuration** — one position per line, each
-//! line a USI `position`
-//! command whose leading `position` keyword may be omitted — so that an
-//! even-position collection already published in USI form loads with no
-//! conversion step. This module is where that text stops: an entry becomes a
-//! [`StartSpec`] of [`Move`] values here, and nothing above it ever sees a USI
-//! string (invariant 3, on the configuration side).
+//! A collection is data, not configuration: one position per line, each line a
+//! USI `position` command whose leading `position` keyword may be omitted, so
+//! that a collection already published in USI form loads with no conversion
+//! step. An entry becomes a [`StartSpec`] here, and nothing above this module
+//! ever sees a collection's USI string.
 //!
-//! **The keyword is optional because collections circulate in both shapes.**
-//! Published files hold either the full command or the bare base and move list
-//! a USI engine is fed after the keyword, and requiring one of them would make
-//! the other need the rewrite O-1 exists to avoid. It is one optional token
-//! consumed before the base, so the two shapes of an entry are the same entry
-//! rather than two code paths that could drift.
+//! A move's USI spelling is [`usi::notation`](crate::usi::notation)'s. What is
+//! this module's is everything around the moves: the optional keyword, the
+//! base, and the replay that validates an entry.
 //!
-//! **The conversion is the validation.** Every parsed entry is replayed by
-//! [`StartSpec::traversal`], which runs the ordinary legality path. There is no
-//! second opinion about legality in this file, and no entry reaches a game
-//! without having been replayed once.
+//! The conversion is the validation: every parsed entry is replayed by
+//! [`StartSpec::traversal`], which runs the ordinary legality path.
 //!
-//! **A setup may not pass through the same position four times.** The one
-//! replay answers this too: [`repetition::OCCURRENCES`] is what ends a game, so
-//! an entry already holding that many occurrences of one position has its
-//! verdict decided before `START` — the game would end `#SENNICHITE` the first
-//! time live play re-visits that position, for reasons no client could see in
-//! the `Game_Summary`. Three occurrences stay legal: a client still has a move
-//! to avoid the fourth, which makes that an authored property of the position
-//! set.
+//! A setup may not pass through the same position [`repetition::OCCURRENCES`]
+//! times. Such an entry has its verdict decided before `START` — the game
+//! would end `#SENNICHITE` the first time live play re-visits that position,
+//! for reasons no client could see in the `Game_Summary`. Three occurrences
+//! stay legal: a client still has a move to avoid the fourth.
 //!
-//! **Only the `startpos` base is accepted.** A `sfen` base is the reserved
-//! extension for the handicap milestone (P-9) and is refused by name until
-//! then, so the format needs no change to adopt it later.
+//! Only the `startpos` base is accepted. A `sfen` base is the extension the
+//! format reserves for handicap positions, and is refused by name until that
+//! is supported.
 //!
-//! **Every bad line is reported, not the first.** O-1 phrases validation as
-//! per-entry messages, which is only worth anything if an operator sees all of
-//! them in one pass: failing fast would make a thousand-line collection a
-//! thousand restarts.
+//! Every bad line is reported, not the first: failing fast would make a
+//! thousand-line collection a thousand restarts.
 
 use std::collections::HashMap;
 use std::fs;
@@ -45,26 +33,26 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::game::repetition::{self, PositionKey};
-use crate::game::{HandKind, IllegalSetup, Move, Square, StartSpec};
+use crate::game::{IllegalSetup, StartSpec};
+use crate::usi;
 
 /// The entries of one collection file, in file order.
 ///
-/// A `Collection` exists only if every one of its entries parsed *and*
-/// decoded, which is why the entries are private: there is no way to hold one
-/// that skipped the loader.
-///
-/// An empty collection is an ordinary value here. Whether a *configuration*
-/// may point at one is O-1's question in the config slice, which knows what
-/// the collection is for; this loader would have no reason to give.
+/// A `Collection` exists only if every one of its entries parsed and decoded,
+/// which is why the entries are private. An empty collection is an ordinary
+/// value here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Collection {
     entries: Vec<StartSpec>,
 
-    /// Where each entry was written, one-based, parallel to `entries`. Kept
-    /// beside the entries rather than inside them: an entry is what a game
-    /// starts from, and a line number is a fact about the file it came from,
-    /// which nothing downstream of validation has any use for.
+    /// Where each entry was written, one-based, parallel to `entries`.
     lines: Vec<usize>,
+
+    /// Each entry's canonical USI line, parallel to `entries` — the identity a
+    /// game's starting position is filed and counted under. Here rather than
+    /// re-rendered downstream, so that a position has exactly one spelling in
+    /// this server and the statistics cannot be grouped under a second one.
+    positions: Vec<String>,
 }
 
 impl Collection {
@@ -82,6 +70,7 @@ impl Collection {
     pub fn parse(text: &str) -> Result<Self, Vec<EntryError>> {
         let mut entries = Vec::new();
         let mut lines = Vec::new();
+        let mut positions = Vec::new();
         let mut errors = Vec::new();
 
         for (index, line) in text.lines().enumerate() {
@@ -92,6 +81,7 @@ impl Collection {
                 Ok(entry) => {
                     entries.push(entry);
                     lines.push(index + 1);
+                    positions.push(canonical(line));
                 }
                 Err(reason) => errors.push(EntryError {
                     line: index + 1,
@@ -101,7 +91,11 @@ impl Collection {
         }
 
         if errors.is_empty() {
-            Ok(Self { entries, lines })
+            Ok(Self {
+                entries,
+                lines,
+                positions,
+            })
         } else {
             Err(errors)
         }
@@ -130,19 +124,28 @@ impl Collection {
         &self.entries
     }
 
-    /// The entries paired with the **one-based** line they were written on.
-    ///
-    /// The numbering is the file's, blank lines included, so a number here is
-    /// the number an operator's editor shows — the same numbering
-    /// [`EntryError::line`] carries, because the two lists are read together
-    /// in one startup output.
-    ///
-    /// This exists for the O-1 rules that need a configured value to decide
-    /// (`config::validate`). Those run over entries this loader already
-    /// accepted, and their messages have to name an entry the operator can
-    /// find, which `entries()` alone cannot do.
+    /// The entries paired with the one-based line they were written on. The
+    /// numbering is the file's, blank lines included, so a number here is the
+    /// number an operator's editor shows.
     pub fn numbered(&self) -> impl Iterator<Item = (usize, &StartSpec)> {
         self.lines.iter().copied().zip(&self.entries)
+    }
+
+    /// Each entry's canonical USI line, parallel to
+    /// [`entries`](Self::entries): the identity a starting position carries
+    /// everywhere outside this module, with two positions equal exactly when
+    /// these strings are equal in full.
+    ///
+    /// Canonical means the shape [`parse`](Self::parse) settles on: the
+    /// leading `position` keyword always present, one space between tokens,
+    /// and the tokens themselves as the operator wrote them. So
+    /// `startpos moves 7g7f` and `position   startpos   moves 7g7f` reach the
+    /// column as the same bytes.
+    ///
+    /// A collection that lists one line twice has that position twice here,
+    /// and the two share their statistics.
+    pub fn positions(&self) -> &[String] {
+        &self.positions
     }
 
     /// How many entries the collection holds.
@@ -174,10 +177,10 @@ pub struct EntryError {
 
 /// Why a line is not a usable collection entry.
 ///
-/// One variant per O-1 validation rule this loader can decide on its own. The
+/// One variant per validation rule this loader can decide on its own. The
 /// rules that need a configured value — the minimum plies under `Max_Moves`, a
 /// handicap entry carrying an asymmetric allowance, a reduction with no move
-/// by the reduced side — are the config slice's, because they validate a
+/// by the reduced side — are `config`'s, because they validate a
 /// configuration *against* a loaded collection rather than a line against the
 /// format.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -200,10 +203,9 @@ pub enum EntryReason {
     #[error("no base; the only base accepted is `startpos`")]
     MissingBase,
 
-    /// A `sfen` base. Refused by name rather than as an unknown base: O-1
-    /// makes `sfen` the reserved extension for the handicap milestone, so an
-    /// operator who wrote one is early rather than wrong.
-    #[error("a `sfen` base is reserved for handicap positions (P-9); only `startpos` is accepted")]
+    /// A `sfen` base. Refused by name rather than as an unknown base, because
+    /// `sfen` is the extension reserved for handicap positions.
+    #[error("a `sfen` base is reserved for handicap positions; only `startpos` is accepted")]
     SfenBase,
 
     /// A base that is neither `startpos` nor `sfen`.
@@ -234,21 +236,18 @@ pub enum EntryReason {
 
     /// The sequence is grammatical but the replay refused a move.
     ///
-    /// The ordinal printed is **one-based**, converted from
-    /// [`IllegalSetup::index`], which is zero-based and says so. This
-    /// conversion happens here and nowhere else: two numberings that differ by
-    /// one are exactly the kind of thing that goes wrong silently.
+    /// The ordinal printed is one-based, converted from
+    /// [`IllegalSetup::index`], which is zero-based.
     #[error("setup move {}: {}", .0.index + 1, .0.reason)]
     IllegalSetup(#[source] IllegalSetup),
 
     /// The replay passes through one position [`repetition::OCCURRENCES`]
     /// times, which is the count that ends a game.
     ///
-    /// The ply is named so that an operator can find the offence in a long
-    /// sequence. It is a count of *setup moves played*, not an ordinal of a
-    /// move: ply 0 is the transmitted start, which is occurrence one (P-6), and
-    /// so is the reason a sequence can reach four occurrences on its third
-    /// return to the position it began at.
+    /// The ply is a count of setup moves played, not an ordinal of a move: ply
+    /// 0 is the transmitted start, which is occurrence one, and is why a
+    /// sequence can reach four occurrences on its third return to the position
+    /// it began at.
     #[error(
         "ply {ply} is occurrence {} of a position the setup already passed through; \
          a setup may not pass through the same position {} times, \
@@ -278,10 +277,8 @@ pub enum LoadError {
 
     /// The file was read and entries were refused.
     ///
-    /// The message lists every one of them: O-1's observable behavior is that
-    /// startup fails *naming the offending entry*, and a message carrying only
-    /// a count would leave that promise to whichever caller remembers to walk
-    /// the list.
+    /// The message lists every one of them, so that startup fails naming the
+    /// offending entries rather than counting them.
     #[error("{} rejected {} of its entries:\n{}", .path.display(), .errors.len(), listed(.errors))]
     Invalid {
         /// The file the entries came from.
@@ -300,19 +297,16 @@ fn listed(errors: &[EntryError]) -> String {
         .join("\n")
 }
 
-/// The entry, replayed. The positions are the validation and not the product: a
-/// game replays its own start when it begins, and keeping a copy here would
-/// give one derived value two owners.
+/// The entry, replayed. The positions are the validation and not the product:
+/// a game replays its own start when it begins.
 ///
-/// The replay is [`StartSpec::traversal`] rather than
-/// [`StartSpec::decode`] — decode is that traversal's tail, so legality is
-/// decided exactly as before — because the second rule needs the positions
-/// passed through and not only the one arrived at.
+/// The replay is [`StartSpec::traversal`] rather than [`StartSpec::decode`]
+/// because the occurrence rule needs the positions passed through and not only
+/// the one arrived at.
 ///
 /// Occurrences are counted the way `Game::new` seeds a game from the same
-/// traversal: the transmitted start is the first occurrence, and each traversed
-/// position one more. The entry is refused at the occurrence that reaches
-/// [`repetition::OCCURRENCES`], so the ply named is the first offending one.
+/// traversal: the transmitted start is the first occurrence, and each
+/// traversed position one more.
 fn validated(entry: StartSpec) -> Result<StartSpec, EntryReason> {
     let traversal = entry.traversal().map_err(EntryReason::IllegalSetup)?;
 
@@ -328,23 +322,39 @@ fn validated(entry: StartSpec) -> Result<StartSpec, EntryReason> {
     Ok(entry)
 }
 
+/// One accepted line, in the one shape this server spells that position in.
+///
+/// The `position` keyword written whether or not the operator wrote it, then
+/// the tokens the parser read, one space between them. Nothing is re-rendered
+/// from the parsed moves, so this is a normalization of the text rather than a
+/// second encoder; it agrees with
+/// [`usi::position_line`](crate::usi::position_line) because each accepted
+/// token is the only spelling of its move.
+fn canonical(line: &str) -> String {
+    let mut tokens = line.split_whitespace().peekable();
+    tokens.next_if_eq(&"position");
+
+    let mut canonical = String::from("position");
+    for token in tokens {
+        canonical.push(' ');
+        canonical.push_str(token);
+    }
+
+    canonical
+}
+
 /// One line of a collection, as far as the grammar goes.
 ///
-/// The line number is not here because only the caller is counting lines.
-/// Legality is not here either: `P*5f` is a well-formed drop and an illegal
-/// setup at the same time, and the two statements have to stay separable.
+/// Legality is not here: `P*5f` is a well-formed drop and an illegal setup at
+/// the same time.
 ///
 /// Tokens are taken with `split_whitespace`, so a double or trailing space is
-/// not a rejection. Case is *not* normalized: the USI spelling is fixed, and a
-/// collection that loaded here under a lenient reader would fail against every
-/// other tool that reads it.
+/// not a rejection. Case is not normalized: a collection that loaded here
+/// under a lenient reader would fail against every other tool that reads it.
 ///
-/// The leading `position` keyword is optional and consumed **at most once**, so
-/// `position position startpos` names `position` as an unknown base rather than
-/// accepting a second keyword. Whether it was written changes no accepted
-/// entry — prepending `position ` to a line that parses yields an equal
-/// [`StartSpec`] — and only decides which rejection an unrecognized first token
-/// earns.
+/// The leading `position` keyword is optional and consumed at most once, so
+/// `position position startpos` names `position` as an unknown base rather
+/// than accepting a second keyword.
 fn parse_entry(line: &str) -> Result<StartSpec, EntryReason> {
     let mut tokens = line.split_whitespace().peekable();
 
@@ -368,16 +378,16 @@ fn parse_entry(line: &str) -> Result<StartSpec, EntryReason> {
     }
 
     let setup = match tokens.next() {
-        // A bare `startpos`, keyword or not, is a plain hirate entry, which is
-        // a buoy with an empty sequence and not a case of its own
-        // (invariant 2).
+        // A bare `startpos`, keyword or not, is a buoy with an empty sequence.
         None => Vec::new(),
         Some("moves") => {
             let mut setup = Vec::new();
             for token in tokens {
-                setup.push(parse_move(token).ok_or_else(|| EntryReason::MalformedMove {
-                    token: token.to_owned(),
-                })?);
+                setup.push(
+                    usi::parse_move(token).ok_or_else(|| EntryReason::MalformedMove {
+                        token: token.to_owned(),
+                    })?,
+                );
             }
             if setup.is_empty() {
                 return Err(EntryReason::NoMoves);
@@ -394,71 +404,15 @@ fn parse_entry(line: &str) -> Result<StartSpec, EntryReason> {
     Ok(StartSpec::Buoy { setup })
 }
 
-/// One USI move token: `7g7f`, `8h2b+`, or `P*5f`.
-///
-/// Bytes rather than characters, because every accepted byte is ASCII and a
-/// multi-byte character therefore matches no pattern here — it falls out as
-/// malformed rather than needing a check of its own.
-fn parse_move(token: &str) -> Option<Move> {
-    match *token.as_bytes() {
-        // Before the board patterns, and never falling through to them: a `*`
-        // in the second place names a drop whatever the piece letter is, and
-        // an unknown letter makes it a malformed drop rather than a move of
-        // some other shape.
-        [piece, b'*', file, rank] => Some(Move::Drop {
-            piece: hand_kind(piece)?,
-            to: square(file, rank)?,
-        }),
-        [from_file, from_rank, to_file, to_rank] => Some(Move::Board {
-            from: square(from_file, from_rank)?,
-            to: square(to_file, to_rank)?,
-            promote: false,
-        }),
-        [from_file, from_rank, to_file, to_rank, b'+'] => Some(Move::Board {
-            from: square(from_file, from_rank)?,
-            to: square(to_file, to_rank)?,
-            promote: true,
-        }),
-        _ => None,
-    }
-}
-
-/// A USI square: a file digit `1`-`9` and a rank letter `a`-`i`, where `a` is
-/// rank 1.
-///
-/// No bounds check of its own — [`Square::new`] owns that question, and a
-/// coordinate outside the board comes back as `None` from there.
-fn square(file: u8, rank: u8) -> Option<Square> {
-    Square::new(file.checked_sub(b'0')?, rank.checked_sub(b'a')? + 1)
-}
-
-/// A USI drop letter, uppercase.
-///
-/// A King and the promoted kinds are absent because [`HandKind`] has no value
-/// for them, which is the same guarantee that keeps a promoted piece out of a
-/// hand.
-fn hand_kind(letter: u8) -> Option<HandKind> {
-    Some(match letter {
-        b'P' => HandKind::Pawn,
-        b'L' => HandKind::Lance,
-        b'N' => HandKind::Knight,
-        b'S' => HandKind::Silver,
-        b'G' => HandKind::Gold,
-        b'B' => HandKind::Bishop,
-        b'R' => HandKind::Rook,
-        _ => return None,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::{Color, Illegal, Position};
+    use crate::game::{Color, HandKind, Illegal, Move, Position, Square};
 
-    /// The worked collection example.
+    /// A three-ply `startpos` entry, the ordinary shape of a collection line.
     const EXAMPLE: &str = "position startpos moves 7g7f 3c3d 2g2f";
 
-    /// The worked `sfen` example, verbatim.
+    /// An `sfen` base, which the loader reserves and refuses.
     const SFEN_EXAMPLE: &str =
         "position sfen lnsgkgsn1/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL w - 1";
 
@@ -490,8 +444,7 @@ mod tests {
         errors.remove(0)
     }
 
-    /// The same entry text with its leading `position ` keyword removed, so
-    /// that the two shapes of one entry are written once.
+    /// The same entry text with its leading `position ` keyword removed.
     fn without_keyword(text: &str) -> &str {
         text.strip_prefix("position ")
             .expect("the fixture is written with the keyword")
@@ -500,7 +453,7 @@ mod tests {
     fn setup_of(entry: &StartSpec) -> &[Move] {
         match entry {
             StartSpec::Buoy { setup } => setup,
-            StartSpec::Board(_) => panic!("this milestone never produces a written board"),
+            StartSpec::Board(_) => panic!("this loader never produces a written board"),
         }
     }
 
@@ -527,8 +480,7 @@ mod tests {
     fn an_entry_parses_equal_with_or_without_the_leading_keyword() {
         let two_shuttles = shuttles(2);
 
-        // A move list, a bare base, and a long sequence: the keyword decides
-        // nothing about what an accepted line means.
+        // The keyword decides nothing about what an accepted line means.
         for text in [EXAMPLE, "position startpos", two_shuttles.as_str()] {
             assert_eq!(parsed(without_keyword(text)), parsed(text), "{text:?}");
         }
@@ -571,8 +523,7 @@ mod tests {
         let collection = parsed(&mixed);
         assert_eq!(collection, parsed(&keyword_ful));
 
-        // The line numbers are the file's throughout, so a shape change on one
-        // line does not shift the entries around it.
+        // The line numbers are the file's throughout.
         let numbered: Vec<(usize, usize)> = collection
             .numbered()
             .map(|(line, entry)| (line, setup_of(entry).len()))
@@ -581,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn the_published_collection_example_parses_and_decodes_with_white_to_move() {
+    fn a_three_ply_startpos_entry_parses_and_decodes_with_white_to_move() {
         let collection = parsed(EXAMPLE);
         let entry = &collection.entries()[0];
 
@@ -606,15 +557,13 @@ mod tests {
             ]
         );
 
-        // Three plies, so gote is to move -- the same position `StartSpec`'s
-        // square-by-square decode test pins.
+        // Three plies, so gote is to move.
         assert_eq!(decoded(entry).side_to_move(), Color::White);
     }
 
     #[test]
     fn the_move_grammar_covers_a_board_move_a_promotion_and_a_drop() {
-        // Through the grammar alone: `P*5f` is a well-formed drop here and an
-        // illegal setup from hirate, which the legality test below pins.
+        // `P*5f` is a well-formed drop here and an illegal setup from hirate.
         let entry = parse_entry("position startpos moves 7g7f 8h2b+ P*5f")
             .expect("the line is grammatical");
 
@@ -692,10 +641,7 @@ mod tests {
 
     #[test]
     fn a_setup_passing_through_a_position_three_times_is_accepted() {
-        // Two shuttles: hirate at ply 0, ply 4 and ply 8. Three occurrences,
-        // and the game can still end in repetition on the first re-visit --
-        // but a client has a move to avoid it, which makes that an authored
-        // property of the position set rather than a broken entry.
+        // Two shuttles: hirate at ply 0, ply 4 and ply 8, so three occurrences.
         let collection = parsed(&shuttles(2));
 
         assert_eq!(collection.len(), 1);
@@ -722,11 +668,10 @@ mod tests {
 
     #[test]
     fn the_transmitted_start_is_the_occurrence_that_makes_the_fourth() {
-        // P-6's ply-0 rule, applied at load: the transmitted start is
-        // occurrence one. The three shuttles above *move* to hirate only three
-        // times -- plies 4, 8 and 12 -- so an entry validated by counting the
-        // traversed positions alone would be accepted. It is refused because
-        // ply 0 counts.
+        // The three shuttles above move to hirate only three times -- plies 4,
+        // 8 and 12 -- so an entry validated by counting the traversed
+        // positions alone would be accepted. It is refused because ply 0
+        // counts.
         let entry = parse_entry(&shuttles(3)).expect("the line is grammatical");
         let traversal = entry.traversal().expect("the shuttle is legal from hirate");
 
@@ -747,7 +692,7 @@ mod tests {
     #[test]
     fn a_repeating_setup_is_reported_alongside_the_other_refusals() {
         let text = [
-            EXAMPLE,          // 1, valid -- the published O-1 example
+            EXAMPLE,          // 1, valid
             &shuttles(3),     // 2, four occurrences of hirate
             SFEN_EXAMPLE,     // 3, reserved base
             "not a position", // 4
@@ -777,7 +722,7 @@ mod tests {
     #[test]
     fn a_keywordless_sfen_base_is_rejected_by_name_just_the_same() {
         // The keyword is optional for every base, so the reserved extension is
-        // refused by name in both shapes rather than read as a junk line.
+        // refused by name in both shapes.
         let error = sole_rejection(without_keyword(SFEN_EXAMPLE));
 
         assert_eq!(error.reason, EntryReason::SfenBase);
@@ -830,8 +775,7 @@ mod tests {
 
     #[test]
     fn a_second_keyword_is_read_as_an_unknown_base() {
-        // The keyword is consumed at most once, so the operator is told what is
-        // wrong with the base rather than handed a line that quietly parses.
+        // The keyword is consumed at most once.
         assert_eq!(
             sole_rejection("position position startpos").reason,
             EntryReason::UnknownBase {
@@ -953,8 +897,7 @@ mod tests {
 
     #[test]
     fn every_entry_carries_the_file_line_it_was_written_on() {
-        // Blank lines count, so the numbers are the ones an editor shows and
-        // not a running index of entries.
+        // Blank lines count, so the numbers are the ones an editor shows.
         let text = format!("\n{EXAMPLE}\n\nposition startpos\n\n\nposition startpos moves 2g2f\n");
 
         let collection = parsed(&text);
@@ -977,6 +920,61 @@ mod tests {
     }
 
     #[test]
+    fn every_entry_carries_the_canonical_line_it_stands_for() {
+        // Parallel to the entries, in the same order, and one per entry.
+        let text = format!("{EXAMPLE}\nposition startpos\n");
+
+        let collection = parsed(&text);
+
+        assert_eq!(
+            collection.positions(),
+            [
+                "position startpos moves 7g7f 3c3d 2g2f",
+                "position startpos"
+            ]
+        );
+        assert_eq!(collection.positions().len(), collection.entries().len());
+    }
+
+    #[test]
+    fn one_position_written_two_ways_reaches_one_canonical_line() {
+        // The keyword is optional and the spacing is the operator's, so the
+        // same position is the same bytes however it was typed.
+        for written in [
+            EXAMPLE,
+            without_keyword(EXAMPLE),
+            "position   startpos    moves 7g7f   3c3d 2g2f",
+            "  startpos moves 7g7f 3c3d 2g2f  ",
+        ] {
+            let collection = parsed(written);
+
+            assert_eq!(
+                collection.positions(),
+                ["position startpos moves 7g7f 3c3d 2g2f"],
+                "{written:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn two_positions_that_differ_in_a_move_are_two_lines() {
+        let collection = parsed("position startpos moves 7g7f 3c3d\nposition startpos moves 7g7f");
+
+        assert_ne!(collection.positions()[0], collection.positions()[1]);
+    }
+
+    #[test]
+    fn a_refused_line_leaves_no_canonical_line_behind() {
+        // Only an accepted entry appends to either list.
+        let text = format!("{EXAMPLE}\n{SFEN_EXAMPLE}\n");
+
+        assert!(Collection::parse(&text).is_err());
+
+        let accepted = parsed(EXAMPLE);
+        assert_eq!(accepted.positions().len(), 1);
+    }
+
+    #[test]
     fn a_text_with_no_entry_is_an_empty_collection() {
         for text in ["", "\n", "   \n\n"] {
             let collection = parsed(text);
@@ -994,6 +992,7 @@ mod tests {
         ))
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn loading_reads_the_file_and_parses_it() {
         let path = temp_path("collection");
@@ -1007,6 +1006,7 @@ mod tests {
         assert_eq!(collection.len(), 2);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn loading_a_file_with_bad_entries_names_the_path_and_every_line() {
         let path = temp_path("invalid-collection");
@@ -1034,6 +1034,7 @@ mod tests {
         assert!(message.contains("line 3"), "{message}");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn loading_a_file_that_is_not_there_names_the_path() {
         let path = temp_path("absent-collection");

@@ -1,28 +1,23 @@
 //! Move validation and application: whether a move is legal in a position, and
 //! what position it produces.
 //!
-//! Validation lives in the rules engine, so nothing here knows what a CSA line
-//! looks like and nothing here performs I/O (invariants 1 and 3). A rejection is
-//! a typed value; whether it becomes `#ILLEGAL_MOVE` or a protocol error is the
-//! session's decision against the two-class table of illegal moves, made from
-//! the [`Illegal`] returned here.
+//! A rejection is a typed value; whether it becomes `#ILLEGAL_MOVE` or a
+//! protocol error is the session's decision, made from the [`Illegal`]
+//! returned here.
 //!
-//! **One path, used twice.** A setup sequence is replayed through
-//! [`apply_move`] rather than through a shortcut of its own, because replaying
-//! a setup move *is* move application. A buoy start is then correct for the
-//! same reason live play is, and there is no second implementation to drift.
+//! A setup sequence is replayed through [`apply_move`] rather than through a
+//! shortcut of its own, so there is no second implementation to drift.
 //!
-//! The mover is always [`Position::side_to_move`]. A [`Move`] carries no color,
-//! so "a move by the side not to move" is not expressible here — it is a
-//! session-side distinction, not a rule.
+//! The mover is always [`Position::side_to_move`]. A [`Move`] carries no
+//! color, so "a move by the side not to move" is not expressible here — it is
+//! a session-side distinction, not a rule.
 
 use super::position::{Color, HandKind, Move, NotInHand, Piece, PieceKind, Position, Square};
 
 /// Why a move was refused.
 ///
-/// Hand-written rather than derived through `thiserror`: `game/` names nothing
-/// outside `std` (invariant 1), which outranks the crate's usual error-type
-/// convention.
+/// Hand-written rather than derived through `thiserror`, because `game/` names
+/// nothing outside `std`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Illegal {
     /// A board move from a square holding nothing.
@@ -205,7 +200,7 @@ impl std::error::Error for Illegal {
 /// Applies `mv` to `position`, or reports why it is illegal.
 ///
 /// On success the returned position has the move made, the captured piece — if
-/// any — in the mover's hand as its **base** kind, and the turn passed to the
+/// any — in the mover's hand as its base kind, and the turn passed to the
 /// opponent. `position` itself is untouched, so a caller may probe a move
 /// without unwinding it.
 pub fn apply_move(position: &Position, mv: Move) -> Result<Position, Illegal> {
@@ -214,13 +209,9 @@ pub fn apply_move(position: &Position, mv: Move) -> Result<Position, Illegal> {
 
 /// Whether `color`'s king is attacked.
 ///
-/// Public because P-6's perpetual-check rule counts the moves over which one
-/// side kept the opponent in check, and asks this question of every one of
-/// them.
-///
-/// A color with no king on the board is **not** in check. Positions under
-/// construction pass through this function, and a panic there would turn a
-/// half-built board into a dropped connection.
+/// A color with no king on the board is not in check: positions under
+/// construction pass through here, and a panic would turn a half-built board
+/// into a dropped connection.
 pub fn in_check(position: &Position, color: Color) -> bool {
     match king_square(position, color) {
         Some(king) => is_attacked_by(position, king, color.opponent()),
@@ -232,11 +223,10 @@ pub fn in_check(position: &Position, color: Color) -> bool {
 ///
 /// Deciding a pawn drop is uchifuzume means asking whether the opponent has a
 /// legal reply, and each candidate reply is itself validated. Suspending the
-/// rule inside that search bounds the recursion at one level: without it, an
-/// opponent's pawn drop would start a second search, and that one a third.
-/// The suspended case — a reply that both escapes check and mates with a
-/// dropped pawn — costs the side that would play it nothing, since it is only
-/// reached from a position where it is already mated.
+/// rule inside that search bounds the recursion at one level. The suspended
+/// case — a reply that both escapes check and mates with a dropped pawn —
+/// costs the side that would play it nothing, since it is only reached from a
+/// position where it is already mated.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DropPawnMateRule {
     Enforced,
@@ -313,10 +303,9 @@ fn apply_board_move(
     let mut next = position.clone();
     next.set_piece_at(from, None);
     if let Some(captured) = position.piece_at(to) {
-        // The reversion `HandKind::from_piece_kind` deliberately omits happens
-        // here. A King has no hand kind at all; capturing one is reachable only
-        // from a position that was already illegal, so it leaves the board and
-        // enters no hand rather than becoming an unrepresentable hand entry.
+        // A King has no hand kind at all; capturing one is reachable only from
+        // a position that was already illegal, so it leaves the board and
+        // enters no hand.
         let base = captured.kind.base().unwrap_or(captured.kind);
         if let Some(held) = HandKind::from_piece_kind(base) {
             next.hand_mut(mover).add(held);
@@ -353,8 +342,8 @@ fn apply_drop(
     }
 
     let mut next = position.clone();
-    // The count was read above, so the hand holds one; mapping keeps the
-    // function total without an `expect` on a client-reachable path.
+    // The count was read above, so the hand holds one; mapping avoids an
+    // `expect` on a client-reachable path.
     next.hand_mut(mover)
         .remove(piece)
         .map_err(Illegal::NotInHand)?;
@@ -371,9 +360,8 @@ fn apply_drop(
 
 /// Whether the side to move has any legal move at all.
 ///
-/// Brute force over every square and every hand kind. The scale is a few
-/// thousand candidate moves, and it runs only when a pawn drop has given
-/// check, so a move-generation framework would buy nothing this slice needs.
+/// Brute force over every square and every hand kind: a few thousand candidate
+/// moves, run only when a pawn drop has given check.
 fn has_legal_move(position: &Position) -> bool {
     let mover = position.side_to_move();
 
@@ -440,9 +428,8 @@ const ORTHOGONAL: [(i8, i8); 4] = [(0, -1), (0, 1), (1, 0), (-1, 0)];
 const DIAGONAL: [(i8, i8); 4] = [(1, -1), (-1, -1), (1, 1), (-1, 1)];
 const FORWARD: [(i8, i8); 1] = [(0, -1)];
 
-/// The one-square patterns of a kind. Promoted Silver, Knight, Lance, and Pawn
-/// all move as Gold, which is why they share its table rather than keeping
-/// four copies that could diverge.
+/// The one-square patterns of a kind. Promoted Silver, Knight, Lance and Pawn
+/// all move as Gold, so they share its table.
 fn steps(kind: PieceKind) -> &'static [(i8, i8)] {
     match kind {
         PieceKind::King => &KING_STEPS,
@@ -547,15 +534,14 @@ fn king_square(position: &Position, color: Color) -> Option<Square> {
 /// The mover's promotion zone: the three ranks nearest the opponent.
 ///
 /// Visible to the rest of `game/` because the jishogi declaration's "enemy
-/// camp" is these same three ranks ([`declaration`](super::declaration)), and
-/// two spellings of one geometry could disagree about a rank.
+/// camp" is these same three ranks, and two spellings of one geometry could
+/// disagree about a rank.
 pub(super) fn in_promotion_zone(color: Color, square: Square) -> bool {
     ranks_from_last(color, square) < 3
 }
 
 /// How many ranks short of the mover's last rank `square` lies — `0` on the
-/// last rank itself. This is what makes "the last two ranks" mean opposite
-/// numbers for the two colors without either being written twice.
+/// last rank itself, for either color.
 fn ranks_from_last(color: Color, square: Square) -> u8 {
     match color {
         Color::Black => square.rank() - 1,
@@ -579,8 +565,8 @@ fn is_dead_drop(kind: HandKind, color: Color, to: Square) -> bool {
     must_promote(kind.to_piece_kind(), color, to)
 }
 
-/// A promoted pawn does not count: the rule is about two *unpromoted* pawns on
-/// a file.
+/// A promoted pawn does not count: the rule is about two unpromoted pawns on a
+/// file.
 fn has_unpromoted_pawn_on_file(position: &Position, color: Color, file: u8) -> bool {
     (1..=9)
         .filter_map(|rank| Square::new(file, rank))
@@ -593,8 +579,7 @@ fn has_unpromoted_pawn_on_file(position: &Position, color: Color, file: u8) -> b
         })
 }
 
-/// Every square, file-major. Visible to the rest of `game/` for the same reason
-/// [`in_promotion_zone`] is: a declaration reads the board square by square too.
+/// Every square, file-major.
 pub(super) fn squares() -> impl Iterator<Item = Square> {
     (1..=9u8).flat_map(|file| (1..=9u8).filter_map(move |rank| Square::new(file, rank)))
 }
@@ -607,9 +592,8 @@ mod tests {
         Square::new(file, rank).expect("test coordinate is on the board")
     }
 
-    /// A board with nothing on it. [`Position`] offers no empty constructor, so
-    /// the shortest route to one is to clear hirate; nothing branches on the
-    /// start being hirate (invariant 2).
+    /// A board with nothing on it. [`Position`] offers no empty constructor,
+    /// so the shortest route to one is to clear hirate.
     fn empty(side_to_move: Color) -> Position {
         let mut position = Position::hirate();
         for square in squares() {
@@ -663,8 +647,8 @@ mod tests {
 
     // -- Application -------------------------------------------------------
 
-    /// The issue's sequence: 7g7f, 3c3d, 8h2b+ (Bishop takes and promotes),
-    /// 3a2b (Silver recaptures).
+    /// 7g7f, 3c3d, 8h2b+ (Bishop takes and promotes), 3a2b (Silver
+    /// recaptures).
     #[test]
     fn the_opening_sequence_applies_from_hirate() {
         let mut position = Position::hirate();
@@ -758,9 +742,8 @@ mod tests {
     const GOLD_LIKE_LEGAL: &[(u8, u8)] = &[(5, 4), (4, 4), (6, 4), (4, 5), (6, 5), (5, 6)];
     const GOLD_LIKE_ILLEGAL: &[(u8, u8)] = &[(4, 6), (6, 6), (5, 3), (3, 5), (5, 5)];
 
-    /// Every kind, moving from the centre of an otherwise empty board. Each
-    /// row carries reachable squares and unreachable ones, so a pattern cannot
-    /// be widened without a negative case failing.
+    /// A kind, the squares it reaches from the centre of an empty board, and
+    /// the squares it does not.
     type Pattern = (PieceKind, &'static [(u8, u8)], &'static [(u8, u8)]);
 
     fn patterns() -> Vec<Pattern> {
@@ -869,8 +852,6 @@ mod tests {
         }
     }
 
-    /// Reachability is mirrored, not duplicated: White's forward is Black's
-    /// backward.
     #[test]
     fn white_moves_in_the_opposite_direction() {
         let position = with(
@@ -887,8 +868,6 @@ mod tests {
         expect_illegal(&position, board((4, 4), (3, 2)));
     }
 
-    /// The four Gold-movers are the same mover, checked over the whole board
-    /// rather than over a chosen handful of squares.
     #[test]
     fn promoted_silver_knight_lance_and_pawn_move_exactly_as_gold() {
         fn destinations(kind: PieceKind) -> Vec<(u8, u8)> {
@@ -1196,8 +1175,6 @@ mod tests {
             expect_illegal(&checked, board((1, 7), (1, 6))),
             Illegal::KingLeftInCheck
         );
-        // Addressing the check is what makes the same board playable: block it,
-        // capture the checker, or step aside.
         expect_legal(&checked, board((5, 5), (4, 5)));
 
         let unchecked = with(
@@ -1237,8 +1214,7 @@ mod tests {
         assert!(!in_check(&taken, Color::Black));
         assert_eq!(taken.hand(Color::Black).count(HandKind::Gold), 1);
 
-        // The same gold, defended, cannot be taken by the king: the capture
-        // would land the king on an attacked square.
+        // The same gold, defended, cannot be taken by the king.
         let defended = with(
             &[
                 (5, 5, Color::Black, PieceKind::King),

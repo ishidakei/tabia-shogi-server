@@ -1,19 +1,12 @@
 //! How a game starts, and how that reaches a [`Position`].
 //!
-//! Configuration and the wire both stay on encodings, and neither becomes the
-//! internal type: a [`StartSpec`] is decoded to a
-//! `Position` before any rule ever sees it. This module decodes; it does not
-//! encode (invariant 3 both ways). USI parsing belongs to the loading slice and
-//! CSA rendering to `csa/position_block.rs`, so nothing here handles text.
+//! This module decodes; it does not encode, and no wire spelling reaches it
+//! either way. Replaying a setup sequence is move application, so it runs
+//! through [`apply_move`] rather than through a shortcut of its own.
 //!
-//! **One path, used twice.** Replaying a setup sequence is move application, so
-//! it runs through [`apply_move`] rather than through a shortcut of its own. A
-//! buoy start is then correct for the same reason live play is.
-//!
-//! Hirate appears here as the replay anchor and in no other role — the second
-//! of its two legitimate homes under invariant 2. Nothing below asks whether a
-//! decoded position is hirate, and an empty sequence is not a special case but
-//! a loop that does not run.
+//! Hirate appears here as the replay anchor and in no other role. Nothing
+//! below asks whether a decoded position is hirate, and an empty sequence is
+//! not a special case but a loop that does not run.
 
 use super::legality::{Illegal, apply_move};
 use super::position::{Move, Position};
@@ -21,11 +14,9 @@ use super::position::{Move, Position};
 /// How a start is configured and transmitted. Decoded to a [`Position`] before
 /// any rule ever sees it.
 ///
-/// Deliberately no variant for a plain hirate start: that is a [`Buoy`] with an
-/// empty sequence, and giving it a name of its own would make hirate a
-/// privileged base case (invariant 2). Equally deliberately no category, no
-/// name, and no T-values — those are the loader's and the protocol edge's, and
-/// this type answers one question only: what position does play start from.
+/// No variant for a plain hirate start: that is a [`Buoy`] with an empty
+/// sequence. No category, name or T-values either — this type answers one
+/// question only, what position play starts from.
 ///
 /// [`Buoy`]: StartSpec::Buoy
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,11 +24,9 @@ pub enum StartSpec {
     /// Hirate plus a setup sequence — shogi-server's buoy form, and the
     /// primary path. An empty sequence is a plain hirate start.
     ///
-    /// The moves are game history, not preamble (invariant 5):
+    /// The moves are game history, not preamble:
     /// [`repetition`](super::repetition) counts every position they pass
-    /// through, and `Max_Moves` will count the moves themselves. They are also
-    /// what carries the T-values of an asymmetric allowance, which is the
-    /// clock's business and not visible from here.
+    /// through, and `Max_Moves` counts the moves themselves.
     Buoy {
         /// The moves from hirate to the position play begins from, in order.
         setup: Vec<Move>,
@@ -46,31 +35,24 @@ pub enum StartSpec {
     /// A written board, for positions unreachable from hirate. Handicap only.
     ///
     /// [`StartSpec::decode`] returns this position unchanged and asks nothing
-    /// of it. Whether a written board is a *valid* position — kings present,
-    /// pawn counts, neither king already in check — is P-9's question in the
-    /// handicap milestone, and answering half of it here would leave that slice
-    /// with a validation to either trust or contradict.
+    /// of it: whether a written board is a valid position — kings present,
+    /// pawn counts, neither king already in check — is not checked anywhere
+    /// yet.
     Board(Position),
 }
 
 impl StartSpec {
     /// The position play starts from.
     ///
-    /// A [`Buoy`] is replayed from `Position::hirate()` through
-    /// [`legality::apply_move`], one entry at a time, and the first refusal
-    /// ends the replay: no entry after a failing one is applied, and no partial
-    /// position is produced. The side to move falls out of the replay, so an
-    /// odd-length sequence yields a gote-first start with no special-casing.
+    /// A [`Buoy`] is replayed from `Position::hirate()` one entry at a time,
+    /// and the first refusal ends the replay: no entry after a failing one is
+    /// applied. The side to move falls out of the replay, so an odd-length
+    /// sequence yields a gote-first start with no special-casing.
     ///
     /// A [`Board`] is returned unchanged, side to move included.
     ///
-    /// The replay itself is [`traversal`](Self::traversal)'s, and this is its
-    /// last position — one replay, so the positions a start passes through and
-    /// the position it ends at cannot disagree.
-    ///
     /// [`Buoy`]: StartSpec::Buoy
     /// [`Board`]: StartSpec::Board
-    /// [`legality::apply_move`]: super::legality::apply_move
     pub fn decode(&self) -> Result<Position, IllegalSetup> {
         let mut traversal = self.traversal()?;
 
@@ -83,20 +65,17 @@ impl StartSpec {
     /// position first, then one per setup move, in order. The last is what
     /// [`decode`](Self::decode) answers.
     ///
-    /// Repetition counts all of them (P-6): "the count begins at the
-    /// **transmitted** start — hirate for a buoy game — and every position the
-    /// setup sequence passes through is counted". That is the whole reason this
-    /// exists rather than a second replay at the caller: the setup replay and
-    /// the positions counted must be the same replay, or a start whose
-    /// intermediate positions are counted wrongly is undetectable.
+    /// Repetition counts all of them: the count begins at the transmitted
+    /// start — hirate for a buoy game — and every position the setup sequence
+    /// passes through is counted.
     ///
-    /// A [`Board`] traversal is one position, since a written board passes
-    /// through nothing. Never empty, whichever variant it is.
+    /// A [`Board`] traversal is one position. Never empty, whichever variant
+    /// it is.
     ///
     /// # Errors
     ///
-    /// [`IllegalSetup`] on the first entry the legality path refuses, naming its
-    /// index; no entry after a failing one is applied.
+    /// [`IllegalSetup`] on the first entry the legality path refuses, naming
+    /// its index.
     ///
     /// [`Board`]: StartSpec::Board
     pub fn traversal(&self) -> Result<Vec<Position>, IllegalSetup> {
@@ -122,26 +101,16 @@ impl StartSpec {
 
 /// A setup sequence the legality path refused, and where it did so.
 ///
-/// Hand-written rather than derived through `thiserror`: `game/` names nothing
-/// outside `std` (invariant 1), which outranks the crate's usual error-type
-/// convention.
-///
-/// One failure mode, so a struct rather than an enum. The other ways a
-/// configured start can be wrong — a `sfen` base, a sequence leaving too few
-/// plies under `Max_Moves`, a reduction with no move by the reduced side — are
-/// O-1 rules about the *entry* rather than about the replay, and belong to the
-/// loader, which can name the file and line they came from.
+/// Hand-written rather than derived through `thiserror`, because `game/` names
+/// nothing outside `std`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IllegalSetup {
-    /// Which entry failed: its **zero-based** position in the sequence.
-    ///
-    /// Stated because O-1 presents it to an operator one-based, next to a line
-    /// of a collection file, and two numberings that differ by one are exactly
-    /// the kind of thing that goes wrong silently.
+    /// Which entry failed: its zero-based position in the sequence, where an
+    /// operator is shown it one-based.
     pub index: usize,
 
-    /// Why the legality path refused it, carried whole rather than summarized.
-    /// O-1's operator message is built from this.
+    /// Why the legality path refused it. The operator message is built from
+    /// this.
     pub reason: Illegal,
 }
 
@@ -200,16 +169,12 @@ mod tests {
     /// One quiet board move as a pair of coordinates, from and to.
     type Step = ((u8, u8), (u8, u8));
 
-    /// The worked collection example, `position startpos moves 7g7f 3c3d 2g2f`,
-    /// as `Move` values — the USI
-    /// spelling stops at the loader (invariant 3).
+    /// A collection entry's `7g7f 3c3d 2g2f` as `Move` values.
     const COLLECTION_EXAMPLE: [Step; 3] = [((7, 7), (7, 6)), ((3, 3), (3, 4)), ((2, 7), (2, 6))];
 
     /// The dummy buoy a hirate start uses when it needs a setup sequence to
     /// carry a T-value: both kings step out and back, returning exactly to
-    /// hirate. Written here as plain moves because that is
-    /// all this module can see — `KING_SHUTTLE` and the reduction it carries
-    /// belong to the clock and the protocol edge.
+    /// hirate.
     const KING_SHUTTLE: [Step; 4] = [
         ((5, 9), (5, 8)),
         ((5, 1), (5, 2)),
@@ -243,8 +208,7 @@ mod tests {
             assert_eq!(arrived.color, color);
         }
 
-        // Three plies, so gote is to move (P-2). Nothing special-cases the
-        // parity: the side follows from the replay.
+        // Three plies, so gote is to move.
         assert_eq!(position.side_to_move(), Color::White);
         assert!(position.hand(Color::Black).is_empty());
         assert!(position.hand(Color::White).is_empty());
@@ -371,8 +335,9 @@ mod tests {
 
         let traversal = spec.traversal().expect("legal from hirate");
 
-        // Four positions for three moves: the start is one of them (P-6's own
-        // reason for this method), and the last is what `decode` answers.
+        // Four positions for three moves: the start is one of them, which is
+        // repetition's reason for this method, and the last is what `decode`
+        // answers.
         assert_eq!(traversal.len(), setup.len() + 1);
         assert_eq!(traversal.first(), Some(&Position::hirate()));
         assert_eq!(traversal.last(), Some(&decoded(&spec)));
@@ -389,7 +354,7 @@ mod tests {
 
     #[test]
     fn the_dummy_buoy_traversal_returns_to_the_position_it_began_at() {
-        // The occurrence P-6 counts twice: the shuttle's first and last
+        // The occurrence repetition counts twice: the shuttle's first and last
         // positions are one value, so a game seeded from this traversal holds
         // two occurrences of hirate before its first real move.
         let traversal = buoy(&moves(&KING_SHUTTLE))

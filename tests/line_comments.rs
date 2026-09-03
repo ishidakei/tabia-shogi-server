@@ -1,19 +1,17 @@
 //! The floodgate comment suffix, over real sockets, and what an operator sees
 //! when a line is dropped anyway.
 //!
-//! The M2 gate on 2026-08-16 failed on one line. shogi-server's own bridge,
-//! `bin/usiToCsa.rb`, appends its engine's evaluation and principal variation to
-//! every move it sends —
+//! shogi-server's own bridge, `bin/usiToCsa.rb`, appends its engine's
+//! evaluation and principal variation to every move it sends —
 //!
 //! ```text
 //! +2726FU,'* 56 -8384FU +2625FU -8485FU
 //! ```
 //!
-//! — this server classed that as a malformed line, sent nothing, and Black's
-//! flag fell ten minutes later. Both halves of the fix are asserted here: the
-//! move is played and relayed bare, and a line that really is malformed says so
-//! at `warn` while a game is running, so the cause reaches the default log
-//! before the flag falls rather than not at all.
+//! — and a server that classed that as a malformed line would send nothing back
+//! and let the sender's flag fall ten minutes later. Both halves are asserted
+//! here: the move is played and relayed bare, and a line that really is
+//! malformed says so at `warn` while a game is running.
 
 mod common;
 
@@ -31,6 +29,7 @@ const SUFFIX: &str = ",'* 56 -8384FU +2625FU -8485FU +6978KI";
 /// produces can be found unambiguously in a shared buffer.
 const JUNK: &str = "GARBAGE-FROM-THE-WARN-TEST";
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_game_is_played_out_with_a_comment_on_every_client_line() {
     // One malformed line closes the connection, so a comment counted as one
@@ -70,6 +69,7 @@ async fn a_game_is_played_out_with_a_comment_on_every_client_line() {
     assert_eq!(game.white.summary().await.game_id(), next.game_id());
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_space_where_the_comma_belongs_is_still_a_malformed_line() {
     // shogi-server made this form illegal deliberately, and so does this: the
@@ -83,13 +83,14 @@ async fn a_space_where_the_comma_belongs_is_still_a_malformed_line() {
     // — the observable difference from the comma form, which plays the move.
     game.black.expect_closed().await;
 
-    // And the close is a disconnect, so the move that never played does not
-    // leave the peer waiting for its own flag either. `malformed_limit.rs` is
-    // where that rule is asserted in full.
-    game.white.expect("#CENSORED").await;
+    // The close is a disconnect, so the move that never played does not leave
+    // the peer waiting for its own flag.
+    game.white.expect("%TORYO").await;
+    game.white.expect("#RESIGN").await;
     game.white.expect("#WIN").await;
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_malformed_line_in_a_game_is_warned_about_and_still_closes_at_the_limit() {
     let log = log_buffer();
@@ -103,9 +104,8 @@ async fn a_malformed_line_in_a_game_is_warned_about_and_still_closes_at_the_limi
     game.black.expect("+7776FU,T1").await;
     game.white.expect("+7776FU,T1").await;
 
-    // The second reaches the limit and closes the connection, so the count the
-    // comment rule must not touch is still the one Part 5 closes on. Both are
-    // this one connection's: the counter is per session.
+    // The second reaches the limit and closes the connection. Both are this one
+    // connection's: the counter is per session.
     game.black.send(JUNK).await;
     game.black.expect_closed().await;
 
@@ -128,13 +128,14 @@ async fn a_malformed_line_in_a_game_is_warned_about_and_still_closes_at_the_limi
     }
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_malformed_line_outside_a_game_stays_quiet() {
     let log = log_buffer();
     let server = start(&config_text(4, 1), common::HIRATE).await;
 
-    // Junk from `Waiting`: nothing is on a deadline there, so Part 5's record
-    // stays at `debug` and never reaches the default log.
+    // Junk from `Waiting`: nothing is on a deadline there, so the malformed-line
+    // record stays at `debug` and never reaches the default log.
     let quiet = format!("{JUNK}-FROM-WAITING");
     let mut client = Client::connect(server.local_addr()).await;
     client.login("engine-solo", "token-solo").await;
@@ -167,8 +168,8 @@ fn records_mentioning(log: &Arc<Mutex<Vec<u8>>>, needle: &str) -> Vec<String> {
 /// The buffer the whole binary's logs are captured into, at the level an
 /// operator runs at.
 ///
-/// `INFO` is the point: what is asserted is not that the server can be made to
-/// say something, but that it says it without the operator raising the level.
+/// `INFO`: what is asserted is that the server says it without the operator
+/// raising the level.
 fn log_buffer() -> Arc<Mutex<Vec<u8>>> {
     static BUFFER: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
 

@@ -1,24 +1,21 @@
 //! End to end: `%CHUDAN`, over real sockets.
 //!
-//! Suspension is not supported, and the decision has an exact shape rather than
-//! a silence — the reference's own: `command.rb` classes `%CHUDAN` as an
-//! ordinary special move, `board.rb`'s `handle_one_move` matches it against
-//! `%KACHI` and `%TORYO`, falls through to `:illegal`, and the game ends against
-//! the sender (`GameResultIllegalMoveWin`). So the line an engine gets back is
-//! an illegal move's, and what only a real game can show is that: that a
-//! `%CHUDAN` is answered at all — the failure this replaces left the sender
-//! waiting forever — that both clients see the illegal move's three lines, and
-//! that both engines are back in the pool afterwards.
+//! Suspension is not supported, and the answer is the reference's:
+//! `command.rb` classes `%CHUDAN` as an ordinary special move, `board.rb`'s
+//! `handle_one_move` matches it against `%KACHI` and `%TORYO`, falls through to
+//! `:illegal`, and the game ends against the sender
+//! (`GameResultIllegalMoveWin`). So what a client gets back is an illegal move's
+//! three lines.
 //!
-//! The gating is unit-tested where it is decided (`session::game_task` and
-//! `session::pairing`): out of turn changes nothing, and past the deadline is
-//! `#TIME_UP`. The out-of-turn case appears below as well, because over sockets
-//! "nothing was sent" is only observable as the game carrying on.
+//! The gating is unit-tested where it is decided. The out-of-turn case appears
+//! below as well, because over sockets "nothing was sent" is only observable as
+//! the game carrying on.
 
 mod common;
 
 use common::{one_game, start_default};
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_chudan_ends_the_game_against_its_sender_and_both_are_offered_another() {
     let server = start_default().await;
@@ -37,19 +34,19 @@ async fn a_chudan_ends_the_game_against_its_sender_and_both_are_offered_another(
     game.black.expect("#LOSE").await;
     game.white.expect("#WIN").await;
 
-    // Part 4's last arrow, as for any other termination: both connections are
-    // alive, so both sessions are back in the pool.
+    // Both connections are alive, so both sessions are back in the pool.
     let next = game.black.summary().await;
     assert_ne!(next.game_id(), first_id);
     assert_eq!(game.white.summary().await.game_id(), next.game_id());
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_chudan_from_the_side_not_to_move_leaves_the_game_running() {
     let server = start_default().await;
     let mut game = one_game(&server).await;
 
-    // Black is to move from a hirate start, so this one is out of turn: P-4's
+    // Black is to move from a hirate start, so this one is out of turn: the
     // protocol error, which alters no state and sends nothing.
     game.white.send("%CHUDAN").await;
 

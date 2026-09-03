@@ -1,22 +1,17 @@
-//! Tokens: issued by `web`, verified by `session`, owned by neither.
+//! Credentials: tokens, issued by `web` and verified by `session` and owned by
+//! neither, and the session cookie's signing key.
 //!
-//! This layer has **no dependencies at all**.
-//! `auth` is pure, like `game` — no storage, no runtime, no I/O — and its
-//! `use` lines reach `std` and the three cryptography crates only.
+//! `auth` is pure — no storage, no runtime, no I/O — and its `use` lines reach
+//! `std` and the three cryptography crates only. The caller supplies the
+//! stored hash rather than `auth` fetching it, so there is exactly one
+//! implementation of hashing and comparison and the module stays testable with
+//! no database.
 //!
-//! Purity is achieved by having the caller supply the stored hash rather than
-//! having `auth` fetch it: `session/login.rs` asks `storage` for the row and
-//! verifies, `web` generates and hands the hash to `storage`. The fetch is the
-//! caller's; the cryptography is this module's.
-//!
-//! That split keeps two properties at once. There is exactly **one**
-//! implementation of hashing and comparison — two is how a revoked token keeps
-//! working on one path — and the module stays testable with no database, which
-//! is what a security-critical module most needs.
-//!
-//! The hand-written [`Debug`](std::fmt::Debug) that keeps a token out of the
-//! logs lives here, next to the type it protects.
+//! [`cookie`] is the same shape: the session store one layer up holds the
+//! records and asks this module whether a cookie is one this server wrote.
 
+pub mod cookie;
 pub mod token;
 
+pub use cookie::{CookieKey, opaque_id};
 pub use token::{Token, TokenHash};

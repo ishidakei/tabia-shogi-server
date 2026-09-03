@@ -1,24 +1,17 @@
 //! Repetition: how often a position has occurred, and whether one side kept the
 //! other in check throughout.
 //!
-//! Decided in four steps — identity, counting from the transmitted start, the
-//! fourth occurrence, and the continuous-check streak — with **shogi-server
-//! authoritative** for all four rather than the specification. The
-//! specification lists `#SENNICHITE` and `#OUTE_SENNICHITE` and pairs their
-//! results, and defines neither what makes two positions the same nor how
-//! perpetual check is decided, so `board.rb`'s `update_sennichite` and
-//! `oute_sennichite?` govern. The order of operations below is that source's,
-//! and the tests pin the observable semantics rather than the transcription.
+//! shogi-server is authoritative here rather than the specification, which
+//! lists `#SENNICHITE` and `#OUTE_SENNICHITE` and pairs their results but
+//! defines neither what makes two positions the same nor how perpetual check
+//! is decided. `board.rb`'s `update_sennichite` and `oute_sennichite?` govern,
+//! and the order of operations below is that source's.
 //!
-//! **Perpetual check is a streak, not a span.** The reference does not look back
+//! Perpetual check is a streak, not a span: the reference does not look back
 //! over the moves between the first and the fourth occurrence. It keeps a
-//! history per side which one non-checking move by that side **clears
-//! entirely**, and reads a threshold off it at the fourth occurrence. A side
-//! that checks on most of its moves but not all therefore reaches an ordinary
-//! draw, and the clearing is what makes "continuous" mean continuous.
-//!
-//! Nothing here performs I/O, parses anything, or names a protocol type: `std`
-//! and `game` siblings only (invariant 1).
+//! history per side which one non-checking move by that side clears entirely,
+//! and reads a threshold off it at the fourth occurrence. A side that checks
+//! on most of its moves but not all therefore reaches an ordinary draw.
 
 use std::collections::HashMap;
 
@@ -29,10 +22,8 @@ use super::position::{Color, Position};
 ///
 /// `board.rb`, `sennichite?`: `@history[to_s] >= 4`.
 ///
-/// Public because the collection loader refuses an entry whose *setup* already
-/// reaches this count (O-1): that rule has no threshold of its own — it is this
-/// one, read before `START` — and a second `4` written next to it would be a
-/// copy free to drift.
+/// Public because the collection loader refuses an entry whose setup already
+/// reaches this count, and that rule has no threshold of its own.
 pub const OCCURRENCES: u32 = 4;
 
 /// The mover's own streak count that makes the mover the perpetual checker.
@@ -44,23 +35,15 @@ const CHECKER_THRESHOLD: u32 = 4;
 /// the mover being the side escaping.
 ///
 /// `board.rb`, `oute_sennichite?`: `@gote_history[to_s] >= 3` on Sente's move.
-/// The asymmetry with [`CHECKER_THRESHOLD`] is in the source and P-6 records it
-/// as deliberate: the two counts are taken at different points relative to the
-/// move being processed.
+/// The asymmetry with [`CHECKER_THRESHOLD`] is in the source: the two counts
+/// are taken at different points relative to the move being processed.
 const ESCAPER_THRESHOLD: u32 = 3;
 
 /// A position's identity for repetition purposes.
 ///
-/// P-6 writes the key as the board placement, both hands, and the side to move —
-/// which is exactly what a [`Position`] is, and exactly what its derived equality
-/// compares. Restating those three fields here would put one list in two places,
-/// in the part of the system where the copies drifting apart is the classic bug
-/// P-6 warns about: ply and clock are excluded, and including either would mean
-/// no position ever recurs. Neither is in a `Position` at all, so neither can
-/// creep in.
-///
-/// The newtype earns its keep by stating the intent. A value of this type is an
-/// identity to be counted, not a board to be played on.
+/// The key is the board placement, both hands and the side to move, which is
+/// exactly what a [`Position`] is. Ply and clock are excluded, and including
+/// either would mean no position ever recurs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PositionKey(Position);
 
@@ -93,9 +76,8 @@ pub enum Verdict {
 ///
 /// shogi-server makes an empty history non-empty by writing
 /// `@sente_history["dummy"] = 1` and then tests `size > 0`. That key is a Ruby
-/// stand-in for a missing `bool`, not a rule: aliveness is a fact of its own, so
-/// it is a variant here, and no key of the map is then a value that is not a
-/// position.
+/// stand-in for a missing `bool`, so aliveness is a variant here and every key
+/// of the map is a position.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 enum Streak {
     /// This side's last move left the opponent out of check — or it has not
@@ -104,8 +86,8 @@ enum Streak {
     #[default]
     Broken,
 
-    /// A run of checks is in progress, with the positions it has passed through
-    /// counted.
+    /// A run of checks is in progress, with the positions it has passed
+    /// through counted.
     Checking(HashMap<PositionKey, u32>),
 }
 
@@ -119,7 +101,7 @@ impl Streak {
     }
 
     /// The move left the opponent out of check: the history is cleared
-    /// **entirely**, which is what makes the check continuous rather than merely
+    /// entirely, which is what makes the check continuous rather than merely
     /// frequent.
     fn clear(&mut self) {
         *self = Self::Broken;
@@ -144,10 +126,9 @@ impl Streak {
     }
 }
 
-/// Every occurrence a game has seen, and the two continuous-check histories.
-///
-/// P-6's pair of structures: a global count that decides *whether* the game ends
-/// and a per-side streak that decides *how*.
+/// Every occurrence a game has seen, and the two continuous-check histories:
+/// a global count that decides whether the game ends and a per-side streak
+/// that decides how.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RepetitionState {
     global: HashMap<PositionKey, u32>,
@@ -162,13 +143,10 @@ impl RepetitionState {
 
     /// The transmitted start, before any move.
     ///
-    /// One occurrence, and no streak effect: a start is not a move, so there is
-    /// no mover to make alive and nothing to clear. P-6 is explicit that this
-    /// occurrence exists — "the configured starting position is therefore
-    /// already one occurrence when real play begins, not a fresh start" — and
-    /// the dummy buoy's consequence follows from it with no rule of its own,
-    /// since the shuttle returns exactly to where it began and is counted again
-    /// by its fourth [`record`](Self::record).
+    /// One occurrence, and no streak effect: a start is not a move, so there
+    /// is no mover to make alive and nothing to clear. The configured starting
+    /// position is already one occurrence when real play begins — a dummy buoy
+    /// therefore holds two occurrences of hirate before the first real move.
     pub fn count_start(&mut self, position: &Position) {
         self.count(&PositionKey::of(position));
     }
@@ -178,27 +156,22 @@ impl RepetitionState {
     /// `update_sennichite`'s order exactly, and the order matters:
     ///
     /// 1. the resulting position is counted globally;
-    /// 2. the **mover's** streak is made alive or cleared, on whether the move
+    /// 2. the mover's streak is made alive or cleared, on whether the move
     ///    left the opponent in check;
-    /// 3. **both** alive streaks then count the resulting position — not only
-    ///    the mover's, which is what makes the escaping side's threshold of
-    ///    three reachable;
+    /// 3. both alive streaks then count the resulting position — not only the
+    ///    mover's, which is what makes the escaping side's threshold of three
+    ///    reachable;
     /// 4. at the fourth global occurrence, the verdict is read.
     ///
-    /// **The mover is not a parameter.** A move flips the side to move, so the
-    /// mover is `position.side_to_move().opponent()`, and the side the check
-    /// question is asked about is `position.side_to_move()` itself. Taking the
-    /// mover as well would be a second source of truth a caller could
-    /// contradict — [`Move`](super::Move) carries no piece kind for that same
-    /// reason.
+    /// The mover is not a parameter: a move flips the side to move, so the
+    /// mover is `position.side_to_move().opponent()`.
     pub fn record(&mut self, position: &Position) -> Verdict {
         let key = PositionKey::of(position);
         let mover = position.side_to_move().opponent();
         let occurrences = self.count(&key);
 
-        // "Did this move leave the opponent in check?" — asked of the position
-        // after the move, about the side now to move, who is the mover's
-        // opponent. shogi-server's `checkmated?(!player)`.
+        // Asked of the position after the move, about the side now to move,
+        // who is the mover's opponent: shogi-server's `checkmated?(!player)`.
         if in_check(position, position.side_to_move()) {
             self.streak_mut(mover).begin();
         } else {
@@ -226,8 +199,7 @@ impl RepetitionState {
 
     /// Counts one occurrence of `key`, and answers how many there now are.
     ///
-    /// Saturating rather than wrapping: `Max_Moves` keeps a real game some four
-    /// billion plies short of the ceiling, and a wrapped count would read as a
+    /// Saturating rather than wrapping: a wrapped count would read as a
     /// position that has never occurred.
     fn count(&mut self, key: &PositionKey) -> u32 {
         let occurrences = self.global.entry(key.clone()).or_insert(0);
@@ -247,9 +219,6 @@ impl RepetitionState {
 }
 
 /// Index into a per-side array: `[black, white]`.
-///
-/// `Color`'s own index is private to [`position`](super::position), on the same
-/// terms as the session layer's copies of this.
 const fn slot(side: Color) -> usize {
     match side {
         Color::Black => 0,
@@ -276,14 +245,13 @@ mod tests {
         }
     }
 
-    /// Applies `mv`, failing the test rather than the assertion after it.
     fn applied(position: &Position, mv: Move) -> Position {
         apply_move(position, mv).unwrap_or_else(|error| panic!("{mv:?} was rejected: {error}"))
     }
 
     /// The dummy buoy a hirate start uses when it needs a setup sequence to
-    /// carry a T-value, as plain moves: both kings step out and back, returning
-    /// exactly to hirate with no check anywhere.
+    /// carry a T-value: both kings step out and back, returning exactly to
+    /// hirate with no check anywhere.
     const KING_SHUTTLE: [((u8, u8), (u8, u8)); 4] = [
         ((5, 9), (5, 8)),
         ((5, 1), (5, 2)),
@@ -291,7 +259,6 @@ mod tests {
         ((5, 2), (5, 1)),
     ];
 
-    /// One whole shuttle, as moves.
     fn shuttle() -> Vec<Move> {
         KING_SHUTTLE
             .iter()
@@ -299,7 +266,6 @@ mod tests {
             .collect()
     }
 
-    /// `count` shuttles, one after another.
     fn shuttles(count: usize) -> Vec<Move> {
         let mut moves = Vec::new();
         for _ in 0..count {
@@ -308,9 +274,9 @@ mod tests {
         moves
     }
 
-    /// A square as `checker` sees it: Black's coordinates, mirrored through the
-    /// center for White. Every scenario below is written once, from Black's
-    /// side, and run from both.
+    /// A square as `checker` sees it: Black's coordinates, mirrored through
+    /// the center for White, so each scenario below is written once and run
+    /// from both sides.
     fn mirrored(checker: Color, file: u8, rank: u8) -> Square {
         match checker {
             Color::Black => sq(file, rank),
@@ -318,7 +284,6 @@ mod tests {
         }
     }
 
-    /// One board move in `checker`'s frame.
     fn step(checker: Color, from: (u8, u8), to: (u8, u8)) -> Move {
         Move::Board {
             from: mirrored(checker, from.0, from.1),
@@ -328,14 +293,9 @@ mod tests {
     }
 
     /// The perpetual-check board, in `checker`'s frame, with the checker to
-    /// move.
-    ///
-    /// A rook on 6h, the enemy king on 5a, and the checker's own king out of the
-    /// way on 9i. Sparse deliberately: every square the cycle below uses is
-    /// empty, so each of its moves is legal for the reason it looks legal.
+    /// move: a rook on 6h, the enemy king on 5a, and the checker's own king
+    /// out of the way on 9i. Every square the cycle below uses is empty.
     fn perpetual_board(checker: Color) -> Position {
-        // Cleared square by square rather than built by a constructor: `game`
-        // has no empty position, and hirate is where a board comes from.
         let mut position = Position::hirate();
         for file in 1..=9 {
             for rank in 1..=9 {
@@ -355,16 +315,11 @@ mod tests {
         position
     }
 
-    /// The four-ply cycle, from the position with the rook on 4h and the checker
-    /// to move:
-    ///
-    /// - the rook steps onto file 5 and checks the king on 5a;
-    /// - the king escapes to 4a;
-    /// - the rook steps onto file 4 and checks it there;
-    /// - the king returns to 5a, and the cycle closes.
-    ///
-    /// Every move by the checker leaves the opponent in check, and no move by
-    /// the opponent ever checks the checker.
+    /// The four-ply cycle, from the position with the rook on 4h and the
+    /// checker to move: the rook checks on file 5, the king escapes to 4a, the
+    /// rook checks on file 4, the king returns to 5a. Every move by the
+    /// checker leaves the opponent in check, and no move by the opponent ever
+    /// checks the checker.
     fn cycle(checker: Color) -> [Move; 4] {
         [
             step(checker, (4, 8), (5, 8)),
@@ -410,10 +365,8 @@ mod tests {
     }
 
     /// Plays `moves` from `position`, recording each, and stops at the first
-    /// verdict that is not [`Verdict::None`].
-    ///
-    /// Returns the verdict and how many moves were played to reach it, so a test
-    /// pins *when* the game ended as well as how.
+    /// verdict that is not [`Verdict::None`]. Returns the verdict and how many
+    /// moves were played to reach it.
     fn play(state: &mut RepetitionState, position: &Position, moves: &[Move]) -> (Verdict, usize) {
         let mut position = position.clone();
         for (played, &mv) in moves.iter().enumerate() {
@@ -429,10 +382,7 @@ mod tests {
 
     #[test]
     fn a_position_reached_at_different_plies_is_one_key() {
-        // The shuttle returns exactly to hirate, so the key at ply 0 and the key
-        // at ply 4 are one value — which is only true because ply is not part of
-        // the identity. A clock cannot take part at all: there is none in a
-        // `Position`.
+        // The shuttle returns exactly to hirate.
         let hirate = Position::hirate();
         let mut position = hirate.clone();
         for mv in shuttle() {
@@ -458,8 +408,7 @@ mod tests {
     #[test]
     fn the_fourth_occurrence_of_a_quiet_position_is_a_draw() {
         // Hirate counted once as the start, then three shuttles: the fourth
-        // occurrence falls on the last move of the third, and no move in the
-        // sequence gives check.
+        // occurrence falls on the last move of the third.
         let hirate = Position::hirate();
         let mut state = RepetitionState::new();
         state.count_start(&hirate);
@@ -479,25 +428,22 @@ mod tests {
     #[test]
     fn a_start_that_is_not_counted_needs_one_repetition_more() {
         // The same twelve moves with no `count_start` reach three occurrences,
-        // not four. This is P-6's step 2 as an executable fact: the transmitted
-        // start is an occurrence, and skipping it undercounts by one.
+        // not four: the transmitted start is an occurrence, and skipping it
+        // undercounts by one.
         let hirate = Position::hirate();
         let mut state = RepetitionState::new();
 
         assert_eq!(play(&mut state, &hirate, &shuttles(3)), (Verdict::None, 12));
 
-        // The very next move ends it instead: every position the shuttle passes
-        // through has now occurred three times, so the first of a fourth shuttle
-        // is a fourth occurrence. Counted from the start, it is *hirate* that
-        // reaches four, three plies later and at the end of a shuttle — the same
-        // game, ending at a different move.
+        // The very next move ends it instead: every position the shuttle
+        // passes through has now occurred three times, so the first of a fourth
+        // shuttle is a fourth occurrence.
         assert_eq!(play(&mut state, &hirate, &shuttle()), (Verdict::Draw, 1));
     }
 
     #[test]
     fn counting_the_start_touches_neither_streak() {
-        // A start is not a move: there is no mover to make alive, and a start
-        // that happens to be a check does not begin anyone's streak.
+        // A start that happens to be a check begins nobody's streak.
         let mut state = RepetitionState::new();
         let checked = applied(&perpetual_board(Color::Black), entry(Color::Black));
 
@@ -511,11 +457,9 @@ mod tests {
     #[test]
     fn continuous_check_loses_for_the_checker_at_its_own_threshold() {
         for checker in [Color::Black, Color::White] {
-            // The state starts one ply before the cycle, so the checked position
-            // first occurs *inside* the streak and the checker's history keeps
-            // pace with the global count. Its fourth occurrence is the fourth
-            // check, thirteen plies in, and the checker's own count is then
-            // exactly the threshold of four.
+            // The state starts one ply before the cycle, so the checked
+            // position first occurs inside the streak and the checker's history
+            // keeps pace with the global count.
             let start = perpetual_board(checker);
             let mut state = RepetitionState::new();
             state.count_start(&start);
@@ -550,17 +494,13 @@ mod tests {
     #[test]
     fn the_escaping_side_wins_at_the_opponents_threshold_of_three() {
         for checker in [Color::Black, Color::White] {
-            // The state starts *on* the cycle instead, so the position with the
-            // checker to move carries the start's own occurrence as a head start
-            // and reaches four first — on a move by the escaping side, whose own
-            // streak that very move clears.
-            //
-            // **This is the both-histories test.** The checker's three counts of
-            // that key were every one of them made on a move by its *opponent*:
-            // the position with the checker to move is only ever produced by the
-            // escaping king's return. An implementation that counted a resulting
-            // position into the mover's history alone would read zero here and
-            // answer `Draw`.
+            // The state starts on the cycle, so the position with the checker
+            // to move carries the start's own occurrence as a head start and
+            // reaches four first — on a move by the escaping side, whose own
+            // streak that very move clears. The checker's three counts of that
+            // key were every one of them made on a move by its opponent, so an
+            // implementation that counted a resulting position into the mover's
+            // history alone would read zero here and answer `Draw`.
             let start = cycle_start(checker);
             let mut state = RepetitionState::new();
             state.count_start(&start);
@@ -581,14 +521,12 @@ mod tests {
     #[test]
     fn one_quiet_move_clears_the_streak_entirely_and_the_same_repetition_draws() {
         for checker in [Color::Black, Color::White] {
-            // The scenario above with one cycle replaced by a detour: the
-            // checker walks its own king out and back while the enemy king steps
-            // aside and returns. The detour ends where it began, so the fourth
-            // occurrence still falls on the twelfth ply — but the checker's
-            // history was cleared on the way, so it holds one occurrence rather
-            // than three and the game is a plain draw. Only a history cleared
-            // *entirely* produces this: one that decremented, or that kept
-            // anything from before the break, would still reach three.
+            // The scenario above with one cycle replaced by a detour that ends
+            // where it began, so the fourth occurrence still falls on the
+            // twelfth ply — but the checker's history was cleared on the way,
+            // so it holds one occurrence rather than three. Only a history
+            // cleared entirely produces this: one that decremented, or that
+            // kept anything from before the break, would still reach three.
             let start = cycle_start(checker);
             let detour = [
                 step(checker, (9, 9), (8, 9)),
@@ -616,8 +554,7 @@ mod tests {
     #[test]
     fn a_streak_survives_the_opponents_moves_and_the_opponents_never_begins() {
         // The clearing is per side: a move by the escaping side never touches
-        // the checker's history, which is why checking on every one of its own
-        // moves is continuous even though the opponent moves in between.
+        // the checker's history.
         let checker = Color::Black;
         let start = perpetual_board(checker);
         let mut state = RepetitionState::new();

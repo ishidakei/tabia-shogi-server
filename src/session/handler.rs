@@ -1,11 +1,9 @@
 //! The session state machine: what each state does with a line, and how a
 //! state changes.
 //!
-//! This module owns the per-connection task and the session state machine. The
-//! *task* — the socket, the reads and writes, the
-//! storage fetch, the timers — arrives with the runtime wiring. What is here is
-//! the machine it will run, on the same terms as the five session pieces before
-//! it: no tokio, no socket, and nothing that asks what time it is.
+//! The task — the socket, the reads and writes, the storage fetch, the timers
+//! — is [`connection`](super::connection)'s. What is here is the machine that
+//! task runs: no tokio, no socket, and nothing that asks what time it is.
 //!
 //! The states and the arrows between them:
 //!
@@ -19,94 +17,74 @@
 //! Finished  --> Waiting: connection alive      Finished  --> [*]: connection closed
 //! ```
 //!
-//! and adds the rule that keeps a reply from being an arrow:
+//! There is no `%%GAME` transition: a client cannot request a game, and one
+//! that sends an extension command anyway gets
+//! `##[WARN] unknown command: <command>` and stays in its current state.
 //!
-//! > There is no `%%GAME` transition: a client cannot request a game. […] A
-//! > client that sends an extension command anyway gets
-//! > `##[WARN] unknown command: <command>` and **stays in its current state** —
-//! > the reply is not a transition (P-1).
-//!
-//! Part 5 answers everything the arrows do not, in two rows that are the whole
-//! rest of the matrix:
+//! The error-handling rules answer everything the arrows do not:
 //!
 //! | Category | Handling | What the client sees |
 //! |----------|----------|----------------------|
 //! | Malformed protocol line | Logged; not a move. Repeated occurrences close the connection, and the close is a disconnect: the pairing or game it was in is answered as for a dropped socket ([`on_disconnect`]). | Nothing, unless the state defines a response |
 //! | Command unexpected in this state | Logged with the state and the command | Nothing; the state does not advance |
 //!
-//! and one line that is in neither table: the **keep-alive**. An empty line, or
-//! a line holding one space, is a command in every state and never a malformed
-//! one — the reference classifies it before it consults the player's status, and
-//! its status test only picks which deadline check to run. [`route`] therefore
-//! answers it the same way from all five states, and [`Disposition::KeepAlive`]
-//! leaves the choice of check to the task, which is what holds the game channel.
+//! and one line that is in neither: the keep-alive. An empty line, or a line
+//! holding one space, is a command in every state and never a malformed one —
+//! the reference classifies it before it consults the player's status.
+//! [`route`](SessionState::route) therefore answers it the same way from all
+//! five states, and [`Disposition::KeepAlive`] leaves the choice of deadline
+//! check to the task.
 //!
-//! **[`route`] returns an answer and never a state.** Part 4 makes the warning
-//! a non-transition and Part 5's two error rows say the state does not advance, so a
-//! reply cannot carry one; a state changes only when the task names an [`Edge`]
-//! it took. That is also why `Finished` routes nothing onward — its exit is
-//! "connection alive", which is the task's fact and not a client's line.
+//! [`route`](SessionState::route) returns an answer and never a state: a state
+//! changes only when the task names an [`Edge`] it took.
 //!
-//! **Nothing here inspects a payload.** Whether an `AGREE`'s echoed `<GameID>`
-//! names the offered game is settled — [`agreement`] does not consult it —
-//! whether a move is legal is [`Game`]'s, and whether a token verifies is
-//! [`login::decide`]'s. This module answers only "does this state accept this
-//! kind of line, and where does it go".
+//! Nothing here inspects a payload. This module answers only whether a state
+//! accepts this kind of line, and where it goes.
 //!
-//! **No limit constant lives here.** Part 5 closes the connection on "repeated
-//! occurrences" and no document names the number, so the machine counts and
-//! reports and the task compares the count against a limit the config wiring
-//! will own.
-//!
-//! [`route`]: SessionState::route
-//! [`agreement`]: super::agreement
-//! [`Game`]: super::game_task::Game
-//! [`login::decide`]: super::login::decide
+//! No limit constant lives here: the malformed-line rule closes the connection
+//! on repeated occurrences without fixing a number, so the machine counts and
+//! reports and its caller compares against `[csa].max_malformed_lines`.
 
 use std::fmt;
 
 use crate::csa::{Command, Unparsed};
 use crate::game::{Color, Outcome};
 
-/// Where one connection is in Part 4's state machine.
+/// Where one connection is in the session state machine.
 ///
-/// Exactly Part 4's five states, carrying nothing: the side this session plays,
-/// the game it is in, and how many malformed lines it has sent are all facts
-/// the task owns, and folding any of them in here would make the matrix a
-/// function of more than the state.
+/// Exactly the five states above, carrying nothing: the side this session
+/// plays, the game it is in and how many malformed lines it has sent are all
+/// facts the task owns.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum SessionState {
-    /// The connection is open and no `LOGIN` has been accepted on it. Part 4's
-    /// entry state, which is why it is the [`Default`].
+    /// The connection is open and no `LOGIN` has been accepted on it. The
+    /// machine's entry state, which is why it is the [`Default`].
     #[default]
     Connected,
 
     /// Logged in and in the matchmaking pool. A successful login lands here
     /// directly: game conditions are server-side, so there is nothing for the
-    /// client to ask for (P-1, Part 4).
+    /// client to ask for.
     Waiting,
 
     /// A `Game_Summary` has been sent and the pairing is waiting for both
-    /// agreements (P-3).
+    /// agreements.
     Agreeing,
 
-    /// Both sides agreed, `START` went out, and the game is running (P-4).
+    /// Both sides agreed, `START` went out, and the game is running.
     Playing,
 
-    /// The game ended and its three termination lines have been written (P-7).
+    /// The game ended and its three termination lines have been written.
     /// Whether this connection goes back to [`Waiting`](Self::Waiting) or
-    /// closes is Part 4's last pair of arrows, and the task's to take.
+    /// closes is the machine's last pair of arrows, and the task's to take.
     Finished,
 }
 
 /// An agreement command, as the only two shapes [`agreement`] accepts.
 ///
 /// A narrowing of [`Command`] rather than an alias for it: handing
-/// `Agreement::agree` a `LOGIN` is then a compile error rather than a routing
-/// bug found in a live session. The echoed `<GameID>` rides along for the log
-/// only — no transition reads it.
-///
-/// [`agreement`]: super::agreement
+/// `Agreement::agree` a `LOGIN` is then a compile error. The echoed
+/// `<GameID>` rides along for the log only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgreementCommand<'a> {
     /// `AGREE [<GameID>]` from this session's side.
@@ -127,50 +105,48 @@ pub enum AgreementCommand<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GameCommand<'a> {
     /// A board move, carried exactly as received. Notation and legality are
-    /// the game side's (P-4).
+    /// the game side's.
     Move {
         /// The line as it arrived, `,T` not yet appended — that is the relay's.
         line: &'a str,
     },
 
-    /// `%TORYO` (P-7, `#RESIGN`).
+    /// `%TORYO`, which ends the game `#RESIGN`.
     Resign,
 
-    /// `%KACHI` (P-7, `#JISHOGI` if the declaration holds, `#ILLEGAL_MOVE` if
+    /// `%KACHI` — `#JISHOGI` if the declaration holds, `#ILLEGAL_MOVE` if
     /// not). Routed like the other declarations; whether it holds is the game
     /// side's `Declaration:Jishogi 1.1` adjudication.
     DeclareWin,
 
-    /// `%CHUDAN` (P-7, `#ILLEGAL_MOVE`). Suspension is not supported, and the
-    /// line is not ignored either: it is routed like the other special moves
-    /// and adjudicated an illegal move by its sender, which is the route the
-    /// reference implementation itself takes.
+    /// `%CHUDAN`, which ends the game `#ILLEGAL_MOVE`. Suspension is not
+    /// supported, and the line is not ignored either: it is adjudicated an
+    /// illegal move by its sender, which is the route the reference
+    /// implementation itself takes.
     Suspend,
 }
 
 /// What the task should do with one parsed line, given the state it is in.
 ///
-/// Every variant is an instruction, not a state: see the module note on why a
-/// reply is never a transition.
+/// Every variant is an instruction, not a state.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Disposition<'a> {
     /// A well-formed `LOGIN` on a connection entitled to one. The task fetches
     /// the row, asks [`login::decide`](super::login::decide), and answers
     /// `LOGIN:<name> OK` or `LOGIN:incorrect` with what comes back.
     RouteLogin {
-        /// The engine name, already validated against Q4.
+        /// The engine name, already validated against its charset and length.
         name: &'a str,
-        /// The presented token, already validated against Q5.
+        /// The presented token, already validated against its charset and
+        /// length.
         token: &'a str,
     },
 
-    /// `LOGIN:incorrect`, then close (P-1, and Part 4's `LOGIN incorrect`
+    /// `LOGIN:incorrect`, then close (the `LOGIN incorrect`
     /// edge out of `Connected`).
     ///
-    /// This is Part 5's "unless the state defines a response": a malformed
-    /// `LOGIN` is owed an answer, and `Connected` is the state that can give
-    /// one. It costs no credential check — the line never parsed as a login,
-    /// so there is nothing to verify.
+    /// A malformed `LOGIN` is owed an answer, and it costs no credential
+    /// check: the line never parsed as a login.
     LoginIncorrect,
 
     /// Hand to the offered pairing's [`Agreement`](super::agreement::Agreement)
@@ -181,12 +157,12 @@ pub enum Disposition<'a> {
     /// side.
     RouteGame(GameCommand<'a>),
 
-    /// `LOGOUT:completed`, then close. P-1 makes this state-independent: it is
+    /// `LOGOUT:completed`, then close. This is state-independent: it is
     /// answered "from any state".
     Logout,
 
     /// `##[WARN] unknown command: <command>`, echoing the line, with the state
-    /// left alone (Q7, Part 4).
+    /// left alone.
     Warn {
         /// The extension line as received, which is what
         /// [`Response::UnknownCommand`] echoes.
@@ -219,25 +195,22 @@ pub enum Disposition<'a> {
     /// state, and is not a fault either.
     Ignore,
 
-    /// Part 5's unexpected-command row: a command that parsed but has no
-    /// meaning in this state. Logged with the state and the command — both of
-    /// which the caller already holds, which is why nothing is carried — and
+    /// A command that parsed but has no meaning in this state. Logged with the
+    /// state and the command, both of which the caller already holds, and
     /// nothing is sent.
     Unexpected,
 
-    /// Part 5's malformed-line row: a line that did not parse. Logged, nothing
-    /// sent, and the running count reported so the task can close on "repeated
-    /// occurrences" at whatever limit it was configured with.
+    /// A line that did not parse. Logged, nothing sent, and the running count
+    /// reported so the task can close at whatever limit it was configured
+    /// with.
     Malformed {
         /// The connection's malformed-line count, this line included.
         count: u32,
     },
 }
 
-/// Hand-written because [`Disposition::RouteLogin`] holds a token and a derived
-/// `Debug` would print it (invariant 8), on the same terms as [`Command`]'s: a
-/// variant added later has to be written in here, so it cannot inherit a leak
-/// by default.
+/// Hand-written because [`Disposition::RouteLogin`] holds a token and a
+/// derived `Debug` would print it. No credential material in a rendering.
 impl fmt::Debug for Disposition<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -261,7 +234,7 @@ impl fmt::Debug for Disposition<'_> {
     }
 }
 
-/// One of Part 4's arrows between two states.
+/// One of the machine's arrows between two states.
 ///
 /// Closing is not an edge: a closed connection is in no state, and the task
 /// learns to close from [`Disposition::Logout`],
@@ -281,11 +254,11 @@ pub enum Edge {
     BothAgreed,
 
     /// `REJECT` / `agreement timeout` / a disconnect with no game started: the
-    /// pairing is discarded and this session returns to the pool. P-3 conditions
-    /// none of the three on how far the agreement got, so they are one edge.
+    /// pairing is discarded and this session returns to the pool. None of the
+    /// three is conditioned on how far the agreement got, so they are one edge.
     PairingDiscarded,
 
-    /// Every termination cause of P-7, the outcome now set on the game.
+    /// Every termination cause, the outcome now set on the game.
     GameEnded,
 
     /// `connection alive` — the termination lines are written and the session
@@ -293,27 +266,25 @@ pub enum Edge {
     NextGame,
 }
 
-/// What a dropped connection means, per Part 4's "for every state, the
-/// disconnect answer is defined".
+/// What a dropped connection means, under the rule that every state defines a
+/// disconnect answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DisconnectAnswer {
     /// Drop the session. Nothing else is affected: no game exists, and no
     /// opponent is waiting on this connection.
     DropSession,
 
-    /// Drop the session and discard the offered pairing. Returning the *other*
+    /// Drop the session and discard the offered pairing. Returning the other
     /// session to `Waiting` is the task's side of the same event
-    /// ([`Edge::PairingDiscarded`]); P-3 penalizes neither engine and neither
-    /// loses its place in the pool.
+    /// ([`Edge::PairingDiscarded`]).
     DiscardPairing,
 
-    /// End the game against the side that went away — Part 4's
-    /// "during `Playing`, the game ends `#CENSORED` against the disconnected
-    /// side". Other games are untouched (Part 5).
+    /// End the game against the side that went away, as a resignation by it.
+    /// The name is this file's own and names no wire line.
     CensorGame {
         /// The outcome to record, which
-        /// [`termination_of`](super::game_task::termination_of) already maps to
-        /// `#CENSORED` with no echo line.
+        /// [`termination_of`](super::game_task::termination_of) maps to the
+        /// reference's `%TORYO` / `#RESIGN` / result against `by`.
         outcome: Outcome,
     },
 }
@@ -323,9 +294,8 @@ impl SessionState {
     ///
     /// The parse result goes in whole rather than pre-split by the caller, so
     /// that the one [`Unparsed`] a state owes an answer to cannot be answered
-    /// anywhere else. `malformed` is the connection's running count of
-    /// unparseable lines, which this bumps for Part 5's malformed-line row and
-    /// leaves alone otherwise; the limit it is compared against is the task's.
+    /// anywhere else. `malformed` is the connection's running count, which
+    /// this bumps only for a line that did not parse.
     ///
     /// ```
     /// # use tabia_shogi_server::csa::Command;
@@ -352,20 +322,18 @@ impl SessionState {
         malformed: &mut u32,
     ) -> Disposition<'a> {
         match parsed {
-            // The answers that do not read the state at all: P-1 answers
-            // `LOGOUT` "from any state", Q7's warning is Part 4's explicit
-            // non-transition, and the keep-alive is classified by the reference
-            // *before* it consults the player's status — its status test picks
-            // which check to run, never whether the line was legal.
+            // The answers that do not read the state at all: `LOGOUT` is
+            // answered from any state, the warning is a non-transition, and the
+            // keep-alive is classified by the reference before it consults the
+            // player's status.
             Ok(Command::Logout) => Disposition::Logout,
             Ok(Command::Extension { line }) => Disposition::Warn { line },
             Ok(Command::KeepAlive { echo }) => Disposition::KeepAlive { echo },
             Ok(Command::Whitespace) => Disposition::Ignore,
 
-            // A `LOGIN` on an authenticated connection is Part 5's unexpected
-            // row. The duplicate-login rule is about *another* connection
-            // presenting the same token, which is `login::decide`'s and reached
-            // only from `Connected`.
+            // A `LOGIN` on an authenticated connection is unexpected: the
+            // duplicate-login rule is about another connection presenting the
+            // same token, which is reached only from `Connected`.
             Ok(Command::Login { name, token }) => match self {
                 Self::Connected => Disposition::RouteLogin { name, token },
                 Self::Waiting | Self::Agreeing | Self::Playing | Self::Finished => {
@@ -381,9 +349,9 @@ impl SessionState {
             Ok(Command::DeclareWin) => self.playing(GameCommand::DeclareWin),
             Ok(Command::Suspend) => self.playing(GameCommand::Suspend),
 
-            // The codec's contract: a failed `LOGIN` is owed `LOGIN:incorrect`.
-            // The owed answer belongs where a login can be answered, so in
-            // every other state the same line is just a malformed line.
+            // A failed `LOGIN` is owed `LOGIN:incorrect`, and only where a
+            // login can be answered: in every other state the same line is a
+            // malformed line.
             Err(Unparsed::Login(_)) => match self {
                 Self::Connected => Disposition::LoginIncorrect,
                 Self::Waiting | Self::Agreeing | Self::Playing | Self::Finished => count(malformed),
@@ -394,16 +362,15 @@ impl SessionState {
 
     /// Whether a line dropped in this state can cost its sender the game.
     ///
-    /// Part 5 logs a malformed line and sends nothing, which leaves the sender
+    /// A malformed line is logged and nothing is sent, which leaves the sender
     /// waiting for an answer to a line the server discarded — and a clock
     /// running. In `Playing` that ends in `#TIME_UP`, and in `Agreeing` in the
     /// agreement timeout; in the other three states nothing is on a deadline.
-    /// So these two are the states where the discard is logged at `warn` rather
-    /// than at `debug`, which is what puts the cause in an operator's default
-    /// log *before* the flag falls instead of nowhere at all.
+    /// So these two are the states where the discard is logged at `warn`
+    /// rather than at `debug`.
     ///
-    /// Exhaustive rather than a two-arm match with a wildcard: a sixth state
-    /// would have to answer this question rather than inherit an answer.
+    /// Exhaustive rather than a two-arm match with a wildcard, so a sixth
+    /// state has to answer this question rather than inherit an answer.
     ///
     /// ```
     /// # use tabia_shogi_server::session::handler::SessionState;
@@ -437,20 +404,19 @@ impl SessionState {
         }
     }
 
-    /// The state this one leads to along `edge`, or `None` if Part 4 draws no
-    /// such arrow from here.
+    /// The state this one leads to along `edge`, or `None` if the machine draws
+    /// no such arrow from here.
     ///
     /// The only way a state changes, so that the task never assigns one by
-    /// hand. `None` is reported rather than absorbed: Part 4 calls an unhandled
-    /// state a protocol bug, and a machine that quietly stayed put would hide
-    /// exactly that.
+    /// hand. `None` is reported rather than absorbed, since a machine that
+    /// quietly stayed put would hide a protocol bug.
     ///
     /// ```
     /// # use tabia_shogi_server::session::handler::{Edge, SessionState};
     /// let waiting = SessionState::Connected.after(Edge::LoginAccepted);
     /// assert_eq!(waiting, Some(SessionState::Waiting));
     ///
-    /// // A second acceptance is not an arrow out of `Waiting`.
+    /// // A second accepted login is not an arrow out of `Waiting`.
     /// assert_eq!(SessionState::Waiting.after(Edge::LoginAccepted), None);
     /// ```
     pub const fn after(self, edge: Edge) -> Option<Self> {
@@ -477,16 +443,12 @@ impl SessionState {
 
 /// What a dropped connection means from `state`.
 ///
-/// Part 4 defines the answer for every state, so this matches all five: a
-/// missing arm would be the protocol bug it warns about.
+/// Every state defines an answer, so this matches all five.
 ///
 /// `playing_as` is the side this session was assigned, and only
-/// [`Playing`](SessionState::Playing) reads it — which is why it is a [`Color`]
-/// rather than an `Option<Color>`. By the time a session is playing, the
-/// summary's `Your_Turn` has fixed its side, so a `None` there would be a case
-/// Part 4 does not have and this function would have to invent an answer for.
-/// Before `Playing` no answer reads the argument, so what the caller passes
-/// cannot change what it gets back.
+/// [`Playing`](SessionState::Playing) reads it, which is why it is a [`Color`]
+/// rather than an `Option<Color>`: by the time a session is playing, the
+/// summary's `Your_Turn` has fixed its side.
 ///
 /// ```
 /// # use tabia_shogi_server::game::{Color, Outcome};
@@ -520,7 +482,7 @@ pub const fn on_disconnect(state: SessionState, playing_as: Color) -> Disconnect
 ///
 /// `saturating_add` rather than a wrapping bump: a count that wrapped would
 /// hand the task a small number for a connection that has sent four billion
-/// junk lines, and no limit the config can set is anywhere near the ceiling.
+/// junk lines.
 fn count(malformed: &mut u32) -> Disposition<'static> {
     *malformed = malformed.saturating_add(1);
     Disposition::Malformed { count: *malformed }
@@ -531,7 +493,7 @@ mod tests {
     use super::*;
     use crate::csa::LoginRejection;
 
-    /// Part 4's five states, in the order the machine walks them.
+    /// The five states, in the order the machine walks them.
     const STATES: [SessionState; 5] = [
         SessionState::Connected,
         SessionState::Waiting,
@@ -545,9 +507,7 @@ mod tests {
     /// literal [`Disposition`] per entry, in this order.
     ///
     /// One keep-alive, not two: the silent form differs from the echoing one
-    /// only in a field this layer passes through, and
-    /// `a_keep_alive_is_accepted_from_every_state_and_is_never_a_malformed_line`
-    /// crosses both with every state.
+    /// only in a field this layer passes through.
     const INPUTS: [Result<Command<'static>, Unparsed<'static>>; 13] = [
         Ok(Command::Login {
             name: "my-engine-v3",
@@ -590,7 +550,7 @@ mod tests {
     ];
 
     /// Asserts one whole row of the matrix, each cell from a fresh counter so
-    /// that a `Malformed` count reads as "the first one on this connection".
+    /// that a `Malformed` count is the first one on its connection.
     fn assert_row(state: SessionState, expected: [Disposition<'static>; 13]) {
         for (input, expected) in INPUTS.into_iter().zip(expected) {
             let mut malformed = 0;
@@ -605,8 +565,8 @@ mod tests {
 
     #[test]
     fn the_inputs_cover_every_command_variant() {
-        // A twelfth variant breaks this arm list, and then the rows below are
-        // known to be short rather than silently incomplete.
+        // A twelfth variant breaks this arm list, so the rows below cannot be
+        // silently incomplete.
         for command in COMMANDS {
             match command {
                 Command::Login { .. }
@@ -656,8 +616,8 @@ mod tests {
         assert_row(
             SessionState::Waiting,
             [
-                // Authenticated already: Part 5's unexpected row, not a second
-                // login.
+                // Authenticated already: the unexpected-command row, not a
+                // second login.
                 Disposition::Unexpected,
                 Disposition::Logout,
                 Disposition::Unexpected,
@@ -761,18 +721,14 @@ mod tests {
             }
         }
 
-        // Part 4: the reply is not a transition. Nothing here has to assert
-        // that the state survived, because `route` returns no state to replace
-        // it with and no `Edge` names an extension command — the property is
-        // carried by the signature rather than by the machine's behaviour.
+        // The state is not asserted: `route` returns no state to replace it
+        // with, and no `Edge` names an extension command.
     }
 
     #[test]
     fn a_keep_alive_is_accepted_from_every_state_and_is_never_a_malformed_line() {
         // The reference classifies `""` and `" "` in `Command.factory`, before
-        // it looks at the player's status at all — so there is no state in which
-        // a keep-alive is a fault, and none in which it costs the connection a
-        // count toward `max_malformed_lines`.
+        // it looks at the player's status at all.
         for state in STATES {
             for echo in [true, false] {
                 let mut malformed = 0;
@@ -877,16 +833,16 @@ mod tests {
         }
 
         // A malformed `LOGIN` outside `Connected` is a malformed line like any
-        // other, so it shares the count Part 5 closes on.
+        // other, so it shares the count the malformed-line rule closes on.
         assert_eq!(
             SessionState::Waiting
                 .route(Err(Unparsed::Login(LoginRejection::Arity)), &mut malformed),
             Disposition::Malformed { count: 4 }
         );
 
-        // Anything that parsed leaves the count where it was — Part 5's first
-        // row is about lines that did not parse, not about lines that made no
-        // sense here.
+        // Anything that parsed leaves the count where it was — the
+        // malformed-line row is about lines that did not parse, not about lines
+        // that made no sense here.
         for input in INPUTS.into_iter().filter(Result::is_ok) {
             SessionState::Waiting.route(input, &mut malformed);
         }
@@ -918,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    fn the_happy_path_walks_part_4_end_to_end() {
+    fn the_happy_path_walks_the_state_machine_end_to_end() {
         let state = SessionState::default();
 
         let state = state.after(Edge::LoginAccepted).expect("login accepted");
@@ -946,8 +902,8 @@ mod tests {
     }
 
     #[test]
-    fn every_edge_leaves_exactly_the_state_part_4_draws_it_from() {
-        // The whole table, `None` in every cell Part 4 has no arrow for.
+    fn every_edge_leaves_exactly_the_state_the_machine_draws_it_from() {
+        // The whole table, `None` in every cell the machine has no arrow for.
         let expected = [
             (
                 Edge::LoginAccepted,
@@ -1036,7 +992,7 @@ mod tests {
         for state in STATES {
             let answer = on_disconnect(state, Color::Black);
 
-            // Part 4: "an unhandled state is a protocol bug". Each of the five
+            // An unhandled state is a protocol bug. Each of the five
             // reaches one of the three answers, and nothing panics on the way.
             match answer {
                 DisconnectAnswer::DropSession
@@ -1057,6 +1013,9 @@ mod tests {
         );
 
         assert!(printed.contains("my-engine-v3"));
-        assert!(!printed.contains("s3cret"), "invariant 8: {printed}");
+        assert!(
+            !printed.contains("s3cret"),
+            "credential material in a rendering: {printed}"
+        );
     }
 }

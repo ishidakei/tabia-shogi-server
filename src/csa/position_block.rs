@@ -1,66 +1,28 @@
 //! The `Position` hierarchy of `Game_Summary`, in both of its wire encodings.
 //!
-//! This is the place both encodings live and the place they stop: the buoy
-//! form — hirate rows plus a setup sequence, the
-//! primary path — and a directly written board for positions unreachable from
-//! hirate. Neither is an internal representation. Both are produced here from a
-//! [`StartSpec`], and `game` never sees either (invariant 3).
+//! The buoy form — hirate rows plus a setup sequence, the primary path — and a
+//! directly written board for positions unreachable from hirate. Both are
+//! produced here from a [`StartSpec`], and `game` never sees either.
 //!
-//! The shape is the specification's own example (v1.2.1 §3):
-//!
-//! ```text
-//! P1-KY-KE-GI-KI-OU-KI-GI-KE-KY
-//! P2 * -HI *  *  *  *  * -KA *
-//! ...
-//! P9+KY+KE+GI+KI+OU+KI+GI+KE+KY
-//! P+
-//! P-
-//! +
-//! +2726FU,T12
-//! -3334FU,T6
-//! ```
-//!
-//! ```text
-//! <row>   ::= "P" <rank 1-9> <cell>*9      cells run file 9 down to file 1
-//! <cell>  ::= <sign> <letters> | " * "     three characters either way
-//! <hands> ::= "P+" <token>* / "P-" <token>*
-//! <token> ::= "00" <letters>               once per piece held
-//! <turn>  ::= "+" | "-"                    the side to move at the written position
-//! <move>  ::= <csa-move> ",T" <n>          buoy only
-//! ```
-//!
-//! **Inner lines only.** `BEGIN Position` and `END Position` belong to
-//! `game_summary.rs` (P-2), so this module composes into a summary without
-//! owning the nesting.
-//!
-//! **The T-values arrive as data.** Computing them — the Denryu-sen convention,
-//! the increment, the reduction that rides on one setup move — is
-//! `session/clock.rs`'s (P-5). This module writes the numbers it is given, which
-//! is how invariant 4 stays a time-control decision rather than a formatting
-//! one.
+//! Inner lines only: `BEGIN Position` and `END Position` belong to
+//! `game_summary.rs`. The T-values arrive as data; computing them is
+//! `session/clock.rs`'s.
 
 use crate::game::{Color, HandKind, IllegalSetup, Move, Position, Square, StartSpec, apply_move};
 
 use super::notation::{RenderError, WrittenMove, letters_of, sign_of};
 use super::response::MoveEcho;
 
-/// An empty square, three characters wide like every other cell.
-///
-/// Fixed-width cells are what produce the specification's spacing: a row of
-/// nine empty squares comes out with interior double spaces and a trailing
-/// space, with nothing special-casing either.
+/// An empty square, three characters wide like every other cell. Fixed-width
+/// cells produce the specification's spacing: interior double spaces and a
+/// trailing space, with nothing special-casing either.
 const EMPTY_CELL: &str = " * ";
 
 /// The order hand tokens are written in: `HI KA KI GI KE KY FU`, descending.
 ///
-/// **Not verified against shogi-server.** Nothing in M1 emits a written board,
-/// and the specification fixes no order within `P+` / `P-`, so this is a choice
-/// pinned by test rather than an observation. The client-compatibility survey
-/// that comes with handicap positions revisits it.
-///
-/// Written out here rather than taken from [`HandKind::ALL`], which happens to
-/// agree today: an internal reordering of that enum must not silently change
-/// what goes on the wire.
+/// The specification fixes no order within `P+` / `P-`. Written out here
+/// rather than taken from [`HandKind::ALL`], which happens to agree: an
+/// internal reordering of that enum must not silently change the wire.
 const HAND_ORDER: [HandKind; 7] = [
     HandKind::Rook,
     HandKind::Bishop,
@@ -74,17 +36,17 @@ const HAND_ORDER: [HandKind; 7] = [
 /// Why a start could not be written into a `Position` block.
 ///
 /// An unvalidated [`StartSpec`] reaches this module only through a bug —
-/// collections validate at load and O-1 validates at startup — so every variant
-/// here describes a server-side inconsistency rather than anything a client
-/// sent. They are errors and not panics because a panic on the summary path
-/// would take a pairing down with it.
+/// collections validate at load and the configuration validates at startup —
+/// so every variant here describes a server-side inconsistency rather than
+/// anything a client sent. They are errors and not panics because a panic on
+/// the summary path would take a pairing down with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
     /// The T-values do not pair one-to-one with the setup moves.
     ///
     /// Checked before anything is rendered, so a mismatch yields no partial
     /// block. A written board has no setup moves, so a non-empty slice beside
-    /// one lands here with `moves: 0` rather than being silently dropped.
+    /// one lands here with `moves: 0`.
     #[error("one T-value per setup move: {moves} moves, {times} given")]
     TimeCount {
         /// How many moves the setup sequence holds.
@@ -93,11 +55,9 @@ pub enum Error {
         times: usize,
     },
 
-    /// The legality path refused a setup move during the replay.
-    ///
-    /// [`IllegalSetup`] is carried whole rather than restated: this is the same
-    /// condition [`StartSpec::decode`] reports, down to the zero-based index,
-    /// and two spellings of it is how two indexes come to disagree.
+    /// The legality path refused a setup move during the replay. Carried whole
+    /// so that this and [`StartSpec::decode`] cannot number the same move
+    /// differently.
     #[error(transparent)]
     Setup(#[from] IllegalSetup),
 
@@ -105,30 +65,25 @@ pub enum Error {
     /// the replay does not match the move that follows it.
     #[error("setup move {} cannot be written: {reason}", index + 1)]
     Unwritable {
-        /// Which move failed: its **zero-based** position in the sequence, the
+        /// Which move failed: its zero-based position in the sequence, the
         /// same numbering [`IllegalSetup::index`] uses.
         index: usize,
-        /// What `notation.rs` refused, carried whole.
+        /// What the notation layer refused.
         reason: RenderError,
     },
 }
 
 /// The inner lines of the `Position` block for `spec`.
 ///
-/// `setup_times` supplies one consumption value per setup move, in order, as
-/// computed by `session/clock.rs` (P-5). The pairing is checked rather than made
-/// unrepresentable by a `(Move, u32)` argument: the moves live inside the
-/// [`StartSpec`], so a paired type would be built by zipping the two here and
-/// the mismatch would simply move into that zip.
+/// `setup_times` supplies one consumption value per setup move, in order.
 ///
 /// A [`StartSpec::Buoy`] renders hirate's twelve lines and then one
 /// `<move>,T<value>` line per setup move. Rows, hands, and turn line are
 /// constant for every buoy, a capturing setup included — the board written is
 /// hirate, and what the setup captures is carried by the move lines.
 ///
-/// A [`StartSpec::Board`] renders the carried position's own twelve lines and no
-/// move lines, ever; a non-empty `setup_times` beside one is
-/// [`Error::TimeCount`], since a written board has no setup moves.
+/// A [`StartSpec::Board`] renders the carried position's own twelve lines and
+/// no move lines.
 pub fn encode(spec: &StartSpec, setup_times: &[u32]) -> Result<Vec<String>, Error> {
     let setup: &[Move] = match spec {
         StartSpec::Buoy { setup } => setup,
@@ -142,68 +97,92 @@ pub fn encode(spec: &StartSpec, setup_times: &[u32]) -> Result<Vec<String>, Erro
     }
 
     let mut lines = Vec::with_capacity(12 + setup.len());
-    match spec {
-        // Invariant 2's first legitimate home for `hirate()`: the rows the
-        // codec emits for a buoy game. Nothing below asks whether a position is
-        // hirate — the buoy form writes hirate because that is what the
-        // encoding anchors on, not because the start is a special case.
-        StartSpec::Buoy { setup } => {
-            let mut position = Position::hirate();
-            written_position(&position, &mut lines);
-            for (index, (&mv, &consumed)) in setup.iter().zip(setup_times).enumerate() {
-                // Rendered from the position *before* the move, where the
-                // moving piece still stands, and by the side the replay says is
-                // to move -- so the sign alternates and an odd-length setup's
-                // last line carries `-` with nothing special-cased.
-                let text = WrittenMove::of(position.side_to_move(), mv, &position)
-                    .map_err(|reason| Error::Unwritable { index, reason })?
-                    .to_string();
-                // `,T` is spelled in `response.rs` and nowhere else.
-                lines.push(
-                    MoveEcho {
-                        text: &text,
-                        consumed,
-                    }
-                    .to_string(),
-                );
-                position =
-                    apply_move(&position, mv).map_err(|reason| IllegalSetup { index, reason })?;
-            }
-        }
-        StartSpec::Board(position) => written_position(position, &mut lines),
+    written_position(&written_board(spec), &mut lines, Hands::Always);
+    for (text, &consumed) in written_moves(spec, setup)?.iter().zip(setup_times) {
+        lines.push(MoveEcho { text, consumed }.to_string());
     }
+
     Ok(lines)
+}
+
+/// The board a record writes: the same rows, and the side to move.
+///
+/// The one place this departs from the block above — a hand line is written
+/// only where a hand is held. That is shogi-server's own board rendering, and
+/// it is why a record of a buoy game shows `P9…` followed directly by `+`
+/// while a `Position` block shows the bare `P+` and `P-` lines the
+/// specification's example carries.
+///
+/// The moves are not here: a record writes each time on its own line, so its
+/// move sequence is [`written_moves`] with a `T<n>` line after each.
+pub(super) fn diagram(spec: &StartSpec) -> Vec<String> {
+    let mut lines = Vec::with_capacity(11);
+    written_position(&written_board(spec), &mut lines, Hands::WhenHeld);
+
+    lines
+}
+
+/// One CSA move line per entry, rendered from the position each is played in.
+///
+/// `moves` is replayed from the board the start *writes*, and each move is
+/// written down from the position before it, where the moving piece still
+/// stands, by the side the replay says is to move.
+///
+/// No T-values: the wire pairs each line with `,T<n>` and a record writes
+/// `T<n>` on the next line, so each caller adds its own syntax.
+pub(super) fn written_moves(spec: &StartSpec, moves: &[Move]) -> Result<Vec<String>, Error> {
+    let mut position = written_board(spec);
+    let mut lines = Vec::with_capacity(moves.len());
+
+    for (index, &mv) in moves.iter().enumerate() {
+        lines.push(
+            WrittenMove::of(position.side_to_move(), mv, &position)
+                .map_err(|reason| Error::Unwritable { index, reason })?
+                .to_string(),
+        );
+        position = apply_move(&position, mv).map_err(|reason| IllegalSetup { index, reason })?;
+    }
+
+    Ok(lines)
+}
+
+/// The position this start *writes*, whatever position it decodes to. Nothing
+/// here asks whether a start is hirate: the buoy form writes hirate because
+/// that is what the encoding anchors on.
+fn written_board(spec: &StartSpec) -> Position {
+    match spec {
+        StartSpec::Buoy { .. } => Position::hirate(),
+        StartSpec::Board(position) => position.clone(),
+    }
 }
 
 /// The side to move at the position this block *writes*.
 ///
 /// Not the side to move at the configured position: a buoy writes hirate and
-/// leaves the setup sequence to carry the rest, so the answer is hirate's mover
-/// however long that sequence is. A written board answers with its own.
+/// leaves the setup sequence to carry the rest, so the answer is hirate's
+/// mover however long that sequence is.
 ///
-/// Exposed for `game_summary.rs`'s `To_Move` (P-2), which the specification
-/// defines as exactly this value. The key and the turn line inside the block are
-/// therefore one value read twice, rather than two derivations that could
-/// disagree — and the deciding of *which* position is written stays in the
-/// module that does the writing.
+/// Exposed for `game_summary.rs`'s `To_Move`, so that key and the turn line
+/// inside the block are one value read twice.
 pub(super) fn written_side(spec: &StartSpec) -> Color {
-    match spec {
-        StartSpec::Buoy { .. } => Position::hirate().side_to_move(),
-        StartSpec::Board(position) => position.side_to_move(),
-    }
+    written_board(spec).side_to_move()
 }
 
-/// The twelve lines describing a board: nine rows, two hand lines, the turn
-/// line.
-///
-/// One renderer, two callers — the buoy form passes `Position::hirate()` and the
-/// board form passes the position it carries. Sharing all twelve rather than the
-/// rows alone is what makes the buoy's constant part correct by construction:
-/// bare `P+` / `P-` and a `+` turn line are what this function says about
-/// hirate, not constants maintained beside it.
-fn written_position(position: &Position, lines: &mut Vec<String>) {
+/// Whether an empty hand is written as a bare line, or not written at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hands {
+    /// `P+` and `P-` always, bare when the hand is empty — what a
+    /// `Game_Summary` carries.
+    Always,
+
+    /// A hand line only where a piece is held — what a record carries.
+    WhenHeld,
+}
+
+/// The lines describing a board: nine rows, the hand lines, the turn line.
+fn written_position(position: &Position, lines: &mut Vec<String>, hands: Hands) {
     push_rows(position, lines);
-    push_hands(position, lines);
+    push_hands(position, lines, hands);
     lines.push(sign_of(position.side_to_move()).to_string());
 }
 
@@ -212,8 +191,6 @@ fn push_rows(position: &Position, lines: &mut Vec<String>) {
     for rank in 1..=9 {
         let mut row = format!("P{rank}");
         for file in (1..=9).rev() {
-            // Both bounds are literal and on the board, so there is no
-            // client-reachable coordinate here to refuse.
             let square = Square::new(file, rank).expect("1-9 is on the board");
             match position.piece_at(square) {
                 Some(piece) => {
@@ -229,8 +206,9 @@ fn push_rows(position: &Position, lines: &mut Vec<String>) {
     }
 }
 
-/// `P+` and `P-`, one `00XX` token per piece held, bare when the hand is empty.
-fn push_hands(position: &Position, lines: &mut Vec<String>) {
+/// `P+` and `P-`, one `00XX` token per piece held, bare when the hand is empty —
+/// or, under [`Hands::WhenHeld`], not written at all when it is.
+fn push_hands(position: &Position, lines: &mut Vec<String>, hands: Hands) {
     for color in [Color::Black, Color::White] {
         let mut line = format!("P{}", sign_of(color));
         let hand = position.hand(color);
@@ -242,7 +220,10 @@ fn push_hands(position: &Position, lines: &mut Vec<String>) {
                 line.push(second);
             }
         }
-        lines.push(line);
+        // Two characters is the bare form: the header and nothing held.
+        if hands == Hands::Always || line.len() > 2 {
+            lines.push(line);
+        }
     }
 }
 
@@ -251,9 +232,9 @@ mod tests {
     use super::*;
     use crate::game::{HandKind, Piece, PieceKind};
 
-    /// Hirate's rows, as the specification's own example writes them. Each line
-    /// is its own array element so the
-    /// trailing space of an empty-celled row sits inside the quotes.
+    /// Hirate's rows, as the specification's own example writes them. Each
+    /// line is its own array element so the trailing space of an empty-celled
+    /// row sits inside the quotes.
     const HIRATE_ROWS: [&str; 9] = [
         "P1-KY-KE-GI-KI-OU-KI-GI-KE-KY",
         "P2 * -HI *  *  *  *  * -KA * ",
@@ -266,8 +247,6 @@ mod tests {
         "P9+KY+KE+GI+KI+OU+KI+GI+KE+KY",
     ];
 
-    /// The twelve lines every buoy block starts with: hirate's rows, two bare
-    /// hand lines, and hirate's mover.
     fn hirate_block() -> Vec<String> {
         let mut lines: Vec<String> = HIRATE_ROWS.iter().map(|row| row.to_string()).collect();
         lines.push("P+".to_string());
@@ -303,7 +282,6 @@ mod tests {
         }
     }
 
-    /// The specification's own two-move example: 2g2f then 3c3d.
     fn specification_example() -> StartSpec {
         buoy(vec![
             board((2, 7), (2, 6), false),
@@ -316,8 +294,7 @@ mod tests {
         assert_eq!(encoded(&buoy(Vec::new()), &[]), hirate_block());
     }
 
-    /// CSA server protocol v1.2.1 §3: the specification's `Position` example,
-    /// hirate rows through the two move lines with their consumption times.
+    /// CSA server protocol v1.2.1 section 3's `Position` example.
     #[test]
     fn the_specification_example_renders_verbatim() {
         let expected: Vec<String> = HIRATE_ROWS
@@ -332,9 +309,8 @@ mod tests {
 
     #[test]
     fn a_capturing_setup_still_writes_hirate_rows_and_bare_hands() {
-        // 7g7f, 3c3d, 8h2b+ -- the bishop crosses the opened diagonal and takes
-        // gote's. The capture is carried by the move lines; the board written
-        // is still hirate and both hand lines are still bare.
+        // 7g7f, 3c3d, 8h2b+: the capture is carried by the move lines, and the
+        // board written is still hirate.
         let spec = buoy(vec![
             board((7, 7), (7, 6), false),
             board((3, 3), (3, 4), false),
@@ -358,7 +334,7 @@ mod tests {
     #[test]
     fn the_sign_alternates_with_the_replay_including_an_odd_length_setup() {
         // Five plies, so the last line is gote's and the configured position is
-        // gote-first (P-2). Nothing special-cases the parity.
+        // gote-first.
         let spec = buoy(vec![
             board((7, 7), (7, 6), false),
             board((3, 3), (3, 4), false),
@@ -380,9 +356,6 @@ mod tests {
         );
     }
 
-    /// The rendered lines are read back the way a client would read them —
-    /// parse, resolve, apply — and must land where the decoder lands by its own
-    /// route.
     #[test]
     fn every_rendered_move_line_replays_to_the_decoders_position() {
         let spec = buoy(vec![
@@ -413,9 +386,7 @@ mod tests {
     }
 
     /// The dummy buoy: four plies returning exactly to hirate, which is what
-    /// carries a reduction when the start needs no setup of its own. The block
-    /// writes hirate rows and four move lines; which numbers ride on them is
-    /// `session/clock.rs`'s.
+    /// carries a reduction when the start needs no setup of its own.
     #[test]
     fn the_dummy_buoy_king_shuttle_renders_four_move_lines_over_hirate_rows() {
         let spec = buoy(vec![
@@ -440,8 +411,8 @@ mod tests {
 
     #[test]
     fn a_written_board_renders_its_own_rows_hands_and_turn_line_and_no_move_lines() {
-        // A 2-piece handicap board: gote's rook and bishop gone, and this time
-        // in sente's hand, with gote to move.
+        // A 2-piece handicap board: gote's rook and bishop gone and in sente's
+        // hand, with gote to move.
         let mut position = Position::hirate();
         position.set_piece_at(sq(8, 2), None);
         position.set_piece_at(sq(2, 2), None);
@@ -457,7 +428,6 @@ mod tests {
         assert_eq!(lines.len(), 12, "a written board has no move lines");
         assert_eq!(lines[1], "P2 *  *  *  *  *  *  *  *  * ");
         assert_eq!(lines[7], "P8 * +KA *  *  *  *  * +HI * ");
-        // Descending order, multiplicity by repetition: HI KA KI GI KE KY FU.
         assert_eq!(lines[9], "P+00HI00KA");
         assert_eq!(lines[10], "P-00KY00FU00FU");
         assert_eq!(lines[11], "-");
@@ -479,9 +449,6 @@ mod tests {
         assert_eq!(lines[4], "P5 *  *  *  * -UM *  *  *  * ");
     }
 
-    /// The row renderer and `notation.rs` share one table, so a cell spells a
-    /// kind exactly as a move line does. This pins the fourteen spellings on
-    /// the row side; `notation.rs` pins the other direction.
     #[test]
     fn every_one_of_the_fourteen_kinds_renders_its_letters_in_a_cell() {
         let table = [
@@ -517,9 +484,6 @@ mod tests {
         }
     }
 
-    /// The wire order is written out locally so an internal reordering cannot
-    /// change it silently. This is the other half: it still covers every kind a
-    /// hand can hold, exactly once.
     #[test]
     fn the_hand_order_covers_all_seven_hand_kinds_exactly_once() {
         assert_eq!(HAND_ORDER.len(), HandKind::ALL.len());
@@ -532,9 +496,6 @@ mod tests {
         }
     }
 
-    /// The value `game_summary.rs` writes as `To_Move` is the value this module
-    /// writes as the turn line, so the two are checked against each other rather
-    /// than against a literal.
     #[test]
     fn the_written_side_is_the_turn_line_for_both_encodings() {
         let odd = buoy(vec![board((7, 7), (7, 6), false)]);
@@ -581,7 +542,7 @@ mod tests {
     #[test]
     fn an_illegal_setup_move_is_an_error_naming_its_index_rather_than_a_panic() {
         // The rook cannot reach 2b through its own pawn on 2g. It renders --
-        // a rook does stand on 2h -- and the replay is what refuses it.
+        // a rook does stand on 2h -- and the replay refuses it.
         let spec = buoy(vec![board((2, 8), (2, 2), false)]);
 
         assert_eq!(
@@ -644,8 +605,6 @@ mod tests {
             "setup move 2 cannot be written: no piece stands on 77 to move"
         );
 
-        // Transparent: the replay failure reads exactly as `game` states it,
-        // one-based, so the two layers cannot number the same move differently.
         let setup = IllegalSetup {
             index: 2,
             reason: crate::game::Illegal::EmptySquare { from: sq(7, 7) },

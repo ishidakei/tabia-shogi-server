@@ -1,33 +1,16 @@
 //! Token generation, hashing, and verification.
 //!
-//! **A stored token is a plain SHA-256, not a password hash.**
-//! That is deliberate, and it is the opposite of
-//! the right answer for a user-chosen password: a token is 256 bits of OS
+//! A stored token is a plain SHA-256, not a password hash — the opposite of
+//! the right answer for a user-chosen password. A token is 256 bits of OS
 //! entropy, so there is no dictionary to run against it and no low entropy for
-//! a work factor to defend. What argon2 or bcrypt would add instead is
-//! per-verification CPU cost on the CSA login path, which is a hot path when a
-//! hundred engines reconnect after a restart.
+//! a work factor to defend, while argon2 or bcrypt would add per-verification
+//! CPU cost on the CSA login path, which is hot when a hundred engines
+//! reconnect after a restart.
 //!
-//! The obligations that do apply are enforced here, each by a specific piece
-//! of this module:
-//!
-//! - The plaintext is shown once, at issuance, and is not recoverable
-//!   afterwards — only [`TokenHash`] is ever persisted.
-//! - The textual form is **exactly 64 characters**, matching the `open`-mode
-//!   token bound (Q5), so one client
-//!   configuration works against either instance type.
-//! - [`Debug`] is hand-written on [`Token`] and prints a placeholder
-//!   (invariant 8: no credential material in a rendering), so a credential cannot
-//!   reach a log through a derived `Debug` on some later struct that happens
-//!   to hold one. There is no [`Display`](std::fmt::Display) either.
-//! - [`verify`] compares in constant time, so verification cannot leak the
-//!   stored hash by timing.
-//!
-//! Nothing here validates a charset. An issued token is hex; an `open`-mode
-//! token is printable ASCII of 1–64 characters; [`hash`] is total over both,
-//! because the parser in `session/login.rs` is what decides which of them a
-//! `LOGIN` line may carry. A second opinion about that here would be one this
-//! module has no way to report.
+//! Nothing here validates a charset. An issued token is hex, an `open`-mode
+//! token is printable ASCII of 1–64 characters, and [`hash`] is total over
+//! both: the parser in `session/login.rs` decides which of them a `LOGIN` line
+//! may carry.
 
 use std::fmt;
 
@@ -42,9 +25,8 @@ const HASH_BYTES: usize = 32;
 /// The entropy in one issued token, in bytes — 256 bits.
 const TOKEN_BYTES: usize = 32;
 
-/// Lowercase, because the textual form is fixed as lowercase hex and an
-/// uppercase digit would be a different string to every caller that compares
-/// or stores one.
+/// Lowercase: an uppercase digit would be a different string to every caller
+/// that compares or stores one.
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
 /// An issued token in its textual form: the credential itself.
@@ -52,22 +34,12 @@ const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 /// Shown to a user exactly once, at issuance, and never stored — what the
 /// server keeps is the [`TokenHash`].
 ///
-/// The value is 256 bits from the OS entropy source rendered as **lowercase
-/// hex, exactly 64 characters** ([`Token::TEXT_LEN`]). The textual form is
-/// bounded at 64 to match the `open`-mode token bound, and both hex (64) and
-/// base64url (43) fit; hex is chosen because it
-/// needs no additional crate and lands exactly on the bound, so "the longest
-/// token a client must be able to carry" and "what this server issues" are one
-/// number and cannot drift apart.
+/// The value is 256 bits from the OS entropy source rendered as lowercase hex,
+/// exactly 64 characters ([`Token::TEXT_LEN`]), which lands exactly on the
+/// `open`-mode token bound.
 ///
-/// Three absences are deliberate:
-///
-/// - No derived [`Debug`]. The hand-written one below prints a placeholder.
-/// - No [`Display`](std::fmt::Display). Formatting is not a way out; the only
-///   door is [`reveal`](Token::reveal), whose name is the audit trail — a grep
-///   for it lists every place a plaintext escapes this type.
-/// - No [`Clone`]. A credential with one owner is one fewer copy to reason
-///   about, and no caller needs a second.
+/// No [`Display`](std::fmt::Display) and no [`Clone`]: the only door out is
+/// [`reveal`](Token::reveal), whose name is the audit trail.
 pub struct Token(String);
 
 impl Token {
@@ -75,22 +47,16 @@ impl Token {
     /// 64, hex being ASCII.
     pub const TEXT_LEN: usize = 2 * TOKEN_BYTES;
 
-    /// The token as text.
-    ///
-    /// Named for what it does. Every call is a place where a credential
-    /// leaves the type that protects it, and there should be very few: the
-    /// hash taken at issuance, and the page that shows the value once.
+    /// The token as text. Every call is a place where a credential leaves the
+    /// type that protects it.
     pub fn reveal(&self) -> &str {
         &self.0
     }
 }
 
-/// Hand-written, per invariant 8: no credential material in a rendering.
-///
-/// The failure mode this defends against is not this type being logged
-/// directly. It is a later struct that holds a token and derives `Debug`, at
-/// which point the credential is in the logs with nothing in that struct's
-/// source to suggest it.
+/// Hand-written: no credential material in a rendering. The failure mode this
+/// defends against is a later struct that holds a token and derives `Debug`,
+/// with nothing in that struct's source to suggest a credential is in it.
 impl fmt::Debug for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Token(<redacted>)")
@@ -99,15 +65,11 @@ impl fmt::Debug for Token {
 
 /// The SHA-256 of a token: the only form ever persisted.
 ///
-/// Ordinary derives here, and that is not invariant 8 being bent. The
-/// invariant is about token *material*; a database read alone yields nothing
-/// usable, which is the entire point of storing a hash. Redacting it would
-/// make the logs less useful for no gain, and would suggest to a reader that a
-/// stored hash is a secret of the same order as the token, which it is not.
+/// Ordinary derives here: the no-credential-in-a-rendering rule is about token
+/// material, and a stored hash alone yields nothing usable.
 ///
 /// No hex is written or parsed here: whether the column is a blob or a hex
-/// string is `storage`'s decision, and an encoder in `auth` would be a second
-/// textual form of the same value.
+/// string is `storage`'s decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TokenHash([u8; HASH_BYTES]);
 
@@ -131,11 +93,9 @@ impl TokenHash {
 ///
 /// # Panics
 ///
-/// If the OS entropy source cannot produce 32 bytes. The OS RNG is required —
-/// a non-cryptographic RNG here is a vulnerability — so
-/// there is no weaker fallback to reach for, and a server that cannot obtain
-/// entropy must not issue a credential. Nothing reachable from client input
-/// calls this: issuance happens on C-3's authenticated page.
+/// If the OS entropy source cannot produce 32 bytes. There is no weaker
+/// fallback to reach for, and a server that cannot obtain entropy must not
+/// issue a credential. Nothing reachable from client input calls this.
 pub fn generate() -> (Token, TokenHash) {
     let mut bytes = [0u8; TOKEN_BYTES];
 
@@ -161,15 +121,13 @@ pub fn hash(presented: &str) -> TokenHash {
 
 /// Whether a presented token hashes to the stored hash. Constant-time.
 ///
-/// The comparison goes through [`subtle::ConstantTimeEq`] and never `==`.
-/// A `==` over the bytes short-circuits at the first difference, so how long
-/// it takes reveals how long a prefix matched, and a stored hash can be
-/// reconstructed byte by byte from enough attempts. `TokenHash` derives
-/// `PartialEq` for use as a map key and in tests; this path deliberately does
-/// not use it.
+/// The comparison goes through [`subtle::ConstantTimeEq`] and never `==`: a
+/// `==` over the bytes short-circuits at the first difference, so how long it
+/// takes reveals how long a prefix matched, and a stored hash can be
+/// reconstructed byte by byte from enough attempts.
 ///
-/// The presented string is hashed *first*, so the comparison is always over
-/// two fixed-width digests and a truncated token cannot match as a prefix.
+/// The presented string is hashed first, so the comparison is always over two
+/// fixed-width digests and a truncated token cannot match as a prefix.
 pub fn verify(presented: &str, stored: &TokenHash) -> bool {
     // `subtle` implements `ConstantTimeEq` for slices, not for arrays; both
     // sides are the same fixed 32 bytes, so its length check cannot branch on
@@ -178,11 +136,6 @@ pub fn verify(presented: &str, stored: &TokenHash) -> bool {
 }
 
 /// Renders bytes as lowercase hex.
-///
-/// Two nibble lookups per byte rather than `write!`: writing into a `String`
-/// yields a `fmt::Result` that would then have to be discarded, and discarding
-/// a `Result` without a stated reason is forbidden here. This is infallible, so
-/// there is nothing to explain away.
 fn to_hex(bytes: &[u8; TOKEN_BYTES]) -> String {
     let mut text = String::with_capacity(2 * TOKEN_BYTES);
     for byte in bytes {
@@ -286,12 +239,10 @@ mod tests {
 
     #[test]
     fn hash_accepts_an_open_mode_token() {
-        // Q5's `open`-mode form: printable ASCII, 1-64 characters, and no hex
-        // about it. Hashing is total; the charset is the login parser's rule.
-        let stored = hash("test-engine_01");
+        let stored = hash("preset-engine_01");
 
-        assert!(verify("test-engine_01", &stored));
-        assert!(!verify("test-engine_02", &stored));
+        assert!(verify("preset-engine_01", &stored));
+        assert!(!verify("preset-engine_02", &stored));
     }
 
     #[test]

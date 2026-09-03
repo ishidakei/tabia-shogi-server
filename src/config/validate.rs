@@ -1,11 +1,7 @@
-//! The O-1 rules that need a configured value to decide.
+//! The startup rules that need a configured value to decide.
 //!
-//! A position collection has six validation rules. Three are
-//! already enforced where an entry is loaded (`storage/collections.rs`):
-//! legality from hirate, the `startpos`-only base, and — from P-9 onward — a
-//! written board being a valid position. Those are decidable from a line of
-//! the collection file alone. The three here are not: each crosses an entry
-//! with the server's configuration, so neither half can answer on its own.
+//! The rules an entry cannot be judged against on its own — each crosses an
+//! entry with the server's configuration:
 //!
 //! | Rule | Rejected because |
 //! |---|---|
@@ -13,39 +9,27 @@
 //! | A handicap entry may not carry an asymmetric allowance | No sequence exists to carry the reduction, and no null sequence is guaranteed legal from an arbitrary board |
 //! | A setup carrying a reduction must contain a move by the reduced side | Nowhere to place the reduction |
 //!
-//! **The entries are supplied, not fetched.** `config` does not depend on
-//! `storage`: the startup wiring loads the collection and hands the entries
-//! over, the same caller-supplies arrangement that keeps `auth` pure. The
-//! payoff is the same too — these rules are testable by constructing three
-//! [`StartSpec`] values, with no file and no loader.
+//! The entries are supplied, not fetched: `config` does not depend on
+//! `storage`, so these rules are testable with no file and no loader.
 //!
-//! **Every violation is reported, not the first.** A `[limit]` set too tight
+//! Every violation is reported, not the first. A `[limit]` set too tight
 //! breaks every entry of a collection at once, and failing on the first would
-//! make fixing it one restart per entry — `Collection::parse`'s reasoning,
-//! applied to the other half of O-1.
+//! make fixing it one restart per entry.
 //!
-//! This runs once, at startup, and nothing above it validates again: a set that
-//! loads is a set every game can use.
-//!
-//! [`warnings`] is the other half of the same startup pass, and the split is by
-//! consequence rather than by subject: a [`Violation`] is a configuration no
-//! game could be played under, and a [`Warning`] is one that is served exactly
-//! as written and merely said out loud. Nothing here repairs either.
+//! [`warnings`] is the other half of the same startup pass, split by
+//! consequence: a [`Violation`] is a configuration no game could be played
+//! under, and a [`Warning`] is one that is served exactly as written.
 
 use std::fmt;
 
 use crate::game::{Color, StartSpec};
 
-use super::model::{Config, Limit};
+use super::model::{AuthMode, Config, Limit};
 
 /// Checks every entry against the configuration, or reports every violation.
 ///
-/// The entries arrive paired with the **one-based** line they were written on —
-/// [`Collection::numbered`]'s pairs — because O-1's promise is a startup
-/// failure *naming the offending entry*, and a number an operator cannot find
-/// in their file names nothing.
-///
-/// [`Collection::numbered`]: crate::storage::Collection::numbered
+/// The entries arrive paired with the one-based line they were written on, so
+/// that a startup failure names an entry an operator can find in their file.
 ///
 /// # Examples
 ///
@@ -57,13 +41,15 @@ use super::model::{Config, Limit};
 ///     r#"
 /// auth_mode = "open"
 /// positions = "positions.txt"
+/// records = "records"
+/// database = "tabia.sqlite3"
 ///
 /// [limit]
 /// max_moves = 512
 /// min_playable_plies = 40
 ///
-/// [server]
-/// listen = "127.0.0.1:4081"
+/// [csa]
+/// host = "127.0.0.1"
 /// max_malformed_lines = 8
 ///
 /// [time]
@@ -104,9 +90,7 @@ where
 ///
 /// Nothing here refuses a startup: each of these is a combination an operator
 /// is allowed to want, and the only thing wrong with it is that it is probably
-/// not what they meant. Saying so once, at startup, is the whole remedy —
-/// repairing it would be this code overriding a file, and refusing it would be
-/// this code deciding a policy the documents do not fix.
+/// not what they meant.
 ///
 /// # Examples
 ///
@@ -115,8 +99,10 @@ where
 /// # let text = r#"
 /// # auth_mode = "open"
 /// # positions = "positions.txt"
-/// # [server]
-/// # listen = "127.0.0.1:4081"
+/// # records = "records"
+/// # database = "tabia.sqlite3"
+/// # [csa]
+/// # host = "127.0.0.1"
 /// # max_malformed_lines = 8
 /// # [time]
 /// # time_unit = "1sec"
@@ -145,13 +131,28 @@ pub fn warnings(config: &Config) -> Vec<Warning> {
         });
     }
 
+    let active_token_cap = config.accounts.active_token_cap.get();
+    let lifetime_token_cap = config.accounts.lifetime_token_cap.get();
+    if active_token_cap > lifetime_token_cap {
+        warnings.push(Warning::ActiveCapAboveLifetimeCap {
+            active_token_cap,
+            lifetime_token_cap,
+        });
+    }
+
+    if config.auth_mode == AuthMode::Open && config.web.oauth.is_some() {
+        warnings.push(Warning::OauthWithoutGithubMode);
+    }
+
+    if config.auth_mode == AuthMode::Open && !config.web.administrators.is_empty() {
+        warnings.push(Warning::AdministratorsWithoutGithubMode);
+    }
+
     warnings
 }
 
-/// One configured combination worth saying out loud at startup.
-///
-/// [`Rule`]'s shape, minus the line number: a warning is about the
-/// configuration alone, so there is no entry to name.
+/// One configured combination worth saying out loud at startup. A warning is
+/// about the configuration alone, so there is no entry to name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Warning {
     /// A matchmaking interval shorter than the idle delay in front of it.
@@ -161,6 +162,23 @@ pub enum Warning {
         /// `[matchmaking].idle_delay_seconds`, as written.
         idle_delay_seconds: u64,
     },
+
+    /// An active token cap above the lifetime cap that already bounds it.
+    ActiveCapAboveLifetimeCap {
+        /// `[accounts].active_token_cap`, as written.
+        active_token_cap: u32,
+        /// `[accounts].lifetime_token_cap`, as written.
+        lifetime_token_cap: u32,
+    },
+
+    /// A `[web.oauth]` table on an `open`-mode instance, where nothing reads
+    /// it: such an instance has no accounts for a sign-in to be, so the
+    /// sign-in routes are not served.
+    OauthWithoutGithubMode,
+
+    /// `[web].administrators` written on an `open`-mode instance, where nobody
+    /// can be signed in as one.
+    AdministratorsWithoutGithubMode,
 }
 
 impl fmt::Display for Warning {
@@ -176,15 +194,34 @@ impl fmt::Display for Warning {
                  game has run, the round that started it is already {interval_seconds}s from the \
                  next one, which is sooner than {idle_delay_seconds}s after that game ends"
             ),
+            Self::ActiveCapAboveLifetimeCap {
+                active_token_cap,
+                lifetime_token_cap,
+            } => write!(
+                f,
+                "[accounts] active_token_cap {active_token_cap} is above lifetime_token_cap \
+                 {lifetime_token_cap}, so the active cap can never bind: an account is refused at \
+                 {lifetime_token_cap} tokens ever issued before it can hold {active_token_cap} of \
+                 them at once, and revoking one frees no lifetime slot"
+            ),
+            Self::OauthWithoutGithubMode => f.write_str(
+                "[web.oauth] is written with auth_mode = \"open\", where nothing reads it: an \
+                 open-mode instance has no accounts, so the GitHub sign-in routes are not served \
+                 and the client id has no effect. Set auth_mode = \"github\" to sign visitors in",
+            ),
+            Self::AdministratorsWithoutGithubMode => f.write_str(
+                "[web] administrators is written with auth_mode = \"open\", where nobody can be \
+                 signed in as one: an open-mode instance has no accounts, so the admin page is \
+                 not served and the list has no effect. Set auth_mode = \"github\" to give those \
+                 accounts the admin page",
+            ),
         }
     }
 }
 
-/// Every rule one entry breaks, in the order the table above lists them.
-///
-/// The rules are independent, so an entry breaking two is reported twice — with
-/// one exception, stated at the branch that makes it. An entry breaking none
-/// allocates nothing.
+/// Every rule one entry breaks, in the order the table above lists them. The
+/// rules are independent, so an entry breaking two is reported twice — with
+/// one exception, stated at the branch that makes it.
 fn broken_rules(config: &Config, entry: &StartSpec) -> Vec<Rule> {
     let mut broken = Vec::new();
     let setup_len = authored_len(entry);
@@ -204,13 +241,11 @@ fn broken_rules(config: &Config, entry: &StartSpec) -> Vec<Rule> {
     };
 
     match entry {
-        // One violation, not two. A written board has no setup sequence, which
-        // is the same fact the placement rule would report a second time, and
-        // two messages for one fact is how an operator concludes there are two
-        // problems.
+        // One violation, not two: a written board having no setup sequence is
+        // the same fact the placement rule would report a second time.
         StartSpec::Board(_) => broken.push(Rule::HandicapCannotCarryReduction),
 
-        // An empty setup passes: the server supplies the king shuttle (P-5), so
+        // An empty setup passes: the server supplies the king shuttle, so
         // the T-channel exists even though the operator authored nothing.
         StartSpec::Buoy { setup }
             if !setup.is_empty() && !moves_in(setup.len(), reduction.side) =>
@@ -235,16 +270,11 @@ fn playable_plies(limit: Limit, setup_len: usize) -> u64 {
     u64::from(limit.max_moves).saturating_sub(setup_len as u64)
 }
 
-/// The length of the setup sequence the **operator authored**.
+/// The length of the setup sequence the operator authored.
 ///
-/// Not the length of what is transmitted: a hirate entry under a reduction goes
-/// on the wire as the 4-ply king shuttle, and this does not count those four.
-/// The shuttle's length is P-5's constant, which `config` cannot name without
-/// an upward dependency, and the configured minimum — a number an operator
-/// states in tens of plies — absorbs it. Stated here so that the clock slice
-/// does not later assume the margin already accounted for the shuttle.
-///
-/// A written board authors no setup moves at all.
+/// Not the length of what is transmitted: a hirate entry under a reduction
+/// goes on the wire as the 4-ply king shuttle, and this does not count those
+/// four. The configured minimum absorbs them.
 fn authored_len(entry: &StartSpec) -> usize {
     match entry {
         StartSpec::Buoy { setup } => setup.len(),
@@ -254,16 +284,10 @@ fn authored_len(entry: &StartSpec) -> usize {
 
 /// Whether a setup of `setup_len` plies contains a move by `side`.
 ///
-/// A parity fact rather than a search. Every entry reaching here has passed the
-/// loader's legality replay, which starts from hirate and so alternates
-/// strictly from Black: move 1 is Black's, move 2 White's, and so on. Black
-/// therefore moves in any non-empty setup, and White from two plies on.
-///
-/// Asking each move its color is not the alternative it looks like: a [`Move`]
-/// carries no side, and cannot — which side plays it is a property of the
-/// position it is applied to.
-///
-/// [`Move`]: crate::game::Move
+/// A parity fact rather than a search. Every entry reaching here has passed
+/// the loader's legality replay, which starts from hirate and so alternates
+/// strictly from Black, so Black moves in any non-empty setup and White from
+/// two plies on. A `Move` carries no side to ask.
 fn moves_in(setup_len: usize, side: Color) -> bool {
     match side {
         Color::Black => setup_len >= 1,
@@ -273,29 +297,20 @@ fn moves_in(setup_len: usize, side: Color) -> bool {
 
 /// One entry that the configuration forbids: which line it was, and which rule
 /// it broke.
-///
-/// [`EntryError`]'s shape deliberately: an operator reads both lists in one
-/// startup output, so the two should read alike.
-///
-/// [`EntryError`]: crate::storage::EntryError
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("line {line}: {rule}")]
 pub struct Violation {
-    /// Which line of the collection file, counted from **one** as an
-    /// operator's editor counts them.
+    /// Which line of the collection file, counted from one as an operator's
+    /// editor counts them.
     pub line: usize,
 
-    /// Which rule the entry broke, carried whole.
+    /// Which rule the entry broke.
     #[source]
     pub rule: Rule,
 }
 
-/// Why an entry and this configuration cannot be used together.
-///
-/// One variant per O-1 rule that needs a configured value. The rules an entry
-/// can break on its own live in [`EntryReason`], which the loader reports.
-///
-/// [`EntryReason`]: crate::storage::EntryReason
+/// Why an entry and this configuration cannot be used together: one variant
+/// per startup rule that needs a configured value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Rule {
     /// The setup leaves too little of `Max_Moves` for a game worth playing.
@@ -328,9 +343,7 @@ pub enum Rule {
     NoMoveByReducedSide {
         /// How many plies the operator authored.
         setup_len: usize,
-        /// The reduced side, as [`Reduction::side`] names it.
-        ///
-        /// [`Reduction::side`]: super::model::Reduction::side
+        /// The reduced side.
         side: Color,
     },
 }
@@ -348,7 +361,8 @@ fn spelling(side: Color) -> &'static str {
 mod tests {
     use super::*;
     use crate::config::model::{
-        AuthMode, MatchmakingConfig, Reduction, ServerConfig, TimeConfig, TimeUnit,
+        AccountsConfig, AuthMode, CsaConfig, MatchmakingConfig, RatingsConfig, Reduction,
+        TimeConfig, TimeUnit, WebConfig,
     };
     use crate::game::{Move, Position, Square};
     use std::num::{NonZeroU32, NonZeroU64};
@@ -359,8 +373,8 @@ mod tests {
         Square::new(file, rank).expect("test coordinate is on the board")
     }
 
-    /// A quiet board move. Which move it is never matters here: every rule in
-    /// this module counts plies, and none of them looks at a square.
+    /// A quiet board move. Which move it is never matters: every rule in this
+    /// module counts plies.
     fn a_move() -> Move {
         Move::Board {
             from: sq(7, 7),
@@ -375,9 +389,10 @@ mod tests {
         }
     }
 
-    /// A written board: the kind of entry P-9 will produce, and the only kind
-    /// the handicap rule has anything to say about. Written out rather than
-    /// taken as given, because this milestone's loader produces none.
+    /// A written board: the kind of entry a handicap position produces, and the
+    /// only kind the handicap rule has anything to say about. Written out rather
+    /// than
+    /// taken as given, because the collection loader produces none.
     fn handicap_board() -> StartSpec {
         let mut board = Position::hirate();
         board.set_piece_at(sq(1, 1), None);
@@ -390,6 +405,8 @@ mod tests {
         Config {
             auth_mode: AuthMode::Open,
             positions: PathBuf::from("positions.txt"),
+            records: PathBuf::from("records"),
+            database: PathBuf::from("tabia.sqlite3"),
             limit: None,
             time: TimeConfig {
                 unit: TimeUnit::Second,
@@ -400,13 +417,48 @@ mod tests {
                 roundup: false,
                 reduction: None,
             },
-            server: ServerConfig {
-                listen: "127.0.0.1:0".to_owned(),
+            csa: CsaConfig {
+                host: "127.0.0.1".to_owned(),
+                port: 0,
                 max_malformed_lines: NonZeroU32::MIN,
-                agreement_timeout_seconds: 120,
-                tls: None,
+                ..CsaConfig::default()
             },
             matchmaking: MatchmakingConfig::default(),
+            accounts: AccountsConfig::default(),
+            ratings: RatingsConfig::default(),
+            // Nothing this module validates reads the listener's address.
+            web: WebConfig::default(),
+        }
+    }
+
+    /// The same, with the two caps set.
+    fn with_caps(active_token_cap: u32, lifetime_token_cap: u32) -> Config {
+        Config {
+            accounts: AccountsConfig {
+                active_token_cap: NonZeroU32::new(active_token_cap).expect("a test cap is nonzero"),
+                lifetime_token_cap: NonZeroU32::new(lifetime_token_cap)
+                    .expect("a test cap is nonzero"),
+            },
+            ..config()
+        }
+    }
+
+    /// The same, with `[web].administrators` listed under `mode`.
+    fn with_administrators(mode: AuthMode, administrators: Vec<i64>) -> Config {
+        Config {
+            auth_mode: mode,
+            web: web(administrators),
+            ..config()
+        }
+    }
+
+    /// The web half on an ephemeral port, listing `administrators`.
+    fn web(administrators: Vec<i64>) -> WebConfig {
+        WebConfig {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            oauth: None,
+            administrators,
         }
     }
 
@@ -417,7 +469,7 @@ mod tests {
                 idle_delay_seconds,
                 interval_seconds: NonZeroU64::new(interval_seconds)
                     .expect("a test interval is nonzero"),
-                first_round_at: None,
+                ..MatchmakingConfig::default()
             },
             ..config()
         }
@@ -537,8 +589,8 @@ mod tests {
 
     #[test]
     fn a_one_ply_setup_carries_a_black_reduction_but_not_a_white_one() {
-        // Legality from hirate makes the first ply Black's, so a single move is
-        // a place for Black's reduction and nowhere for White's.
+        // The first ply is Black's, so a single move is a place for Black's
+        // reduction and nowhere for White's.
         accepts(&with_reduction(Color::Black), &buoy(1));
 
         assert_eq!(
@@ -558,7 +610,7 @@ mod tests {
 
     #[test]
     fn an_empty_setup_carries_a_reduction_on_either_side() {
-        // The server supplies the king shuttle (P-5); the operator authors
+        // The server supplies the king shuttle; the operator authors
         // nothing, so there is nothing here to reject.
         accepts(&with_reduction(Color::Black), &buoy(0));
         accepts(&with_reduction(Color::White), &buoy(0));
@@ -686,6 +738,87 @@ mod tests {
 
         assert!(message.contains("interval_seconds 60"), "{message}");
         assert!(message.contains("idle_delay_seconds 120"), "{message}");
+    }
+
+    #[test]
+    fn an_active_cap_above_the_lifetime_cap_warns_without_forbidding_anything() {
+        let config = with_caps(4, 2);
+
+        assert_eq!(
+            warnings(&config),
+            [Warning::ActiveCapAboveLifetimeCap {
+                active_token_cap: 4,
+                lifetime_token_cap: 2,
+            }],
+        );
+        // A warning is not a violation: this configuration still starts.
+        assert_eq!(validate(&config, [(1, &buoy(0))]), Ok(()));
+    }
+
+    #[test]
+    fn the_shipped_caps_and_any_cap_below_the_lifetime_one_warn_about_nothing() {
+        assert_eq!(warnings(&config()), []);
+        assert_eq!(warnings(&with_caps(3, 16)), []);
+        assert_eq!(warnings(&with_caps(2, 2)), []);
+    }
+
+    #[test]
+    fn administrators_listed_in_open_mode_warn_without_forbidding_anything() {
+        // An administrator is a signed-in account, and an `open`-mode instance
+        // has none. The server still starts.
+        let config = with_administrators(AuthMode::Open, vec![4_242]);
+
+        assert_eq!(
+            warnings(&config),
+            [Warning::AdministratorsWithoutGithubMode]
+        );
+        assert_eq!(validate(&config, [(1, &buoy(0))]), Ok(()));
+
+        // The same list in `github` mode is the ordinary configuration, and an
+        // empty one says nothing in either mode.
+        assert_eq!(
+            warnings(&with_administrators(AuthMode::Github, vec![4_242])),
+            []
+        );
+        assert_eq!(
+            warnings(&with_administrators(AuthMode::Open, Vec::new())),
+            []
+        );
+    }
+
+    #[test]
+    fn neither_mode_warns_about_the_web_half_on_its_own() {
+        // Both warnings are about a key written where nothing reads it, and
+        // neither configuration writes one.
+        for auth_mode in [AuthMode::Github, AuthMode::Open] {
+            let config = Config {
+                auth_mode,
+                web: web(Vec::new()),
+                ..config()
+            };
+
+            assert_eq!(warnings(&config), [], "{auth_mode:?}");
+        }
+    }
+
+    #[test]
+    fn the_administrator_warning_names_the_key_and_the_mode() {
+        let message = Warning::AdministratorsWithoutGithubMode.to_string();
+
+        assert!(message.contains("administrators"), "{message}");
+        assert!(message.contains("open"), "{message}");
+    }
+
+    #[test]
+    fn the_cap_warning_names_both_numbers_and_why_they_are_odd() {
+        let message = Warning::ActiveCapAboveLifetimeCap {
+            active_token_cap: 4,
+            lifetime_token_cap: 2,
+        }
+        .to_string();
+
+        assert!(message.contains("active_token_cap 4"), "{message}");
+        assert!(message.contains("lifetime_token_cap 2"), "{message}");
     }
 
     #[test]

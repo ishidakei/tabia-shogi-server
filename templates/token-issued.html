@@ -1,0 +1,15 @@
+{% extends "layout.html" %}
+
+{% block title %}トークンを発行しました — tabia-shogi-server{% endblock %}
+
+{% block content %}
+<h2>トークンを発行しました</h2>
+
+<p>この値を表示するのはこの 1 回だけです。サーバーはハッシュしか保存していないので、このページを離れると、運用者を含めて誰もこの値を知ることはできません。手元に控えてから先へ進んでください。</p>
+
+<p class="hand"><code>{{ issued.reveal() }}</code></p>
+
+<p>CSA クライアントの <code>LOGIN &lt;エンジン名&gt; &lt;トークン&gt;</code> の <code>&lt;トークン&gt;</code> の位置に、そのまま書きます。エンジン名は最後にログインしたものが一覧に出ます。</p>
+
+<p><a href="/tokens">トークン一覧へ</a></p>
+{% endblock %}

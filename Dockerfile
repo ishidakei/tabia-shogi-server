@@ -11,19 +11,51 @@
 # Builder
 # ---------------------------------------------------------------------------
 # rust-toolchain.toml is this project's single source of truth for the
-# toolchain, and this tag must stay equal to the channel it pins (1.97.1
-# today). The file is copied into the build as well, so cargo honours the pin
+# toolchain, and this tag must stay equal to the channel it pins. The file is
+# copied into the build as well, so cargo honours the pin
 # rather than whatever the base image happens to carry; keeping the tag in step
 # is what makes that a no-op instead of a download.
-FROM rust:1.97.1-bookworm AS builder
+FROM rust:1.98.0-bookworm AS builder
 
 WORKDIR /build
 
-# Only what a release build reads. The test suite is not compiled here, so
-# neither tests/ nor the assets they load enter the build context; .dockerignore
-# is written as an allow-list to keep that true as the tree grows.
+# Only what a release build needs. .dockerignore is written as an allow-list so
+# that this stays a short list as the tree grows, and these are its entries.
+#
+# migrations/ and templates/ are build inputs, not runtime ones: `sqlx::migrate!`
+# embeds the first and askama compiles the second, so both travel inside the
+# executable and the runtime stage below needs neither.
+#
+# tests/ is here for a different reason, and the reason is worth writing down
+# because the line looks gratuitous otherwise: this stage runs `cargo build
+# --release`, which compiles no test. But Cargo.toml declares one test target
+# explicitly —
+#
+#     [[test]]
+#     name = "panic_containment"
+#     required-features = ["fault-injection"]
+#
+# — and cargo refuses to *parse* a manifest whose declared target file it cannot
+# find, before it has decided which targets to build. Without this line the
+# build fails at manifest parsing with "can't find `panic_containment` test at
+# `tests/panic_containment.rs`", not at compilation.
+#
+# Copying the directory is the fix rather than dropping the declaration and
+# gating that file from the inside with a crate-level `cfg`. The declaration is
+# what keeps a default `cargo test` from compiling a file whose every line would
+# sit behind one `cfg` — the reasoning is written beside it in Cargo.toml — and
+# it is also the shape that survives a second declared target, where an
+# inside-gated file works only for as long as nobody declares anything. Nothing
+# from tests/ reaches the runtime image: the stage below copies one binary.
+#
+# `tests/docker_context.rs` fails when a target Cargo.toml declares is not
+# admitted by .dockerignore or not covered by one of these COPY lines, so a
+# declaration added without a COPY beside it is caught before the build is.
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY src ./src
+COPY migrations ./migrations
+COPY templates ./templates
+COPY tests ./tests
 
 # --locked: build the dependency versions Cargo.lock records, and fail rather
 # than quietly resolve a different set. An image is supposed to be an artifact
@@ -65,9 +97,12 @@ RUN install -d -o root -g root -m 0755 /etc/tabia
 # as root can read the id, and does not have to resolve a name inside it.
 USER 10001:10001
 
-# The CSA listener's conventional port. The configuration decides the real one —
-# this documents the convention and gives `docker run -P` something to map.
+# The CSA listener's conventional port, and the web half's. The configuration
+# decides the real ones — these document the convention and give `docker run -P`
+# something to map. 8080 is only bound when the configuration writes `[web]`; an
+# instance without one simply has nothing listening behind it.
 EXPOSE 4081
+EXPOSE 8080
 
 # The binary takes exactly one argument, the configuration path
 # (`usage: tabia-shogi-server <config.toml>`), so the default command names the

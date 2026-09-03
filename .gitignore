@@ -13,6 +13,18 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+# Game records. Operational data, never source: a server started from this
+# directory with the quick start's `records = "records"` writes one file per
+# finished game here.
+/records/
+
+# The database, on exactly the same terms — the quick start's
+# `database = "tabia.sqlite3"` lands here, and WAL puts two more files beside
+# it. Operational data, and the one file a deployment backs up.
+/tabia.sqlite3
+/tabia.sqlite3-wal
+/tabia.sqlite3-shm
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

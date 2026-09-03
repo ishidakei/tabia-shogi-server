@@ -1,17 +1,9 @@
 //! A position and the values it is built from.
 //!
-//! The internal representation is a board, always.
-//! Configuration and the wire both use encodings, and neither becomes the
-//! internal type, so nothing here parses or renders anything (invariant 3).
-//!
-//! The types make the impossible unrepresentable where they can: a square off
-//! the board cannot be constructed, and a promoted piece cannot be put in a
-//! hand or dropped, because there is no value to pass.
+//! The internal representation is a board, always. Nothing here parses or
+//! renders anything: a wire spelling stops at the codec that owns it.
 
-/// The two sides, in the naming used throughout.
-///
-/// Sente and gote, the first and second player. CSA writes them `+` and `-`,
-/// which is the protocol layer's business, not this one's.
+/// The two sides: sente and gote, the first and second player.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Color {
     /// Sente, the first player.
@@ -29,8 +21,7 @@ impl Color {
         }
     }
 
-    /// Index into a per-color array, so that "which slot is White's" is
-    /// answered in one place rather than at every call site.
+    /// Index into a per-color array.
     const fn index(self) -> usize {
         match self {
             Self::Black => 0,
@@ -43,8 +34,7 @@ impl Color {
 /// from Black's right, rank 1–9 with rank 1 as White's home rank.
 ///
 /// Only the 81 valid squares exist, because [`Square::new`] is the only way to
-/// build one. Code holding a `Square` therefore needs no bounds check of its
-/// own — an off-board coordinate was refused where it entered.
+/// build one, so code holding a `Square` needs no bounds check of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Square {
     file: u8,
@@ -54,7 +44,7 @@ pub struct Square {
 impl Square {
     /// The square at `file` and `rank`, or `None` if either is off the board.
     ///
-    /// `const` so that a later legality table can be built at compile time.
+    /// `const` so that a legality table can be built at compile time.
     pub const fn new(file: u8, rank: u8) -> Option<Self> {
         if matches!(file, 1..=9) && matches!(rank, 1..=9) {
             Some(Self { file, rank })
@@ -113,8 +103,8 @@ impl PieceKind {
     /// What this kind becomes when promoted, or `None` for a King, a Gold, or
     /// a kind already promoted.
     ///
-    /// The pairing is data. Whether a *move* may promote depends on the
-    /// destination rank and the mover, which is legality's question.
+    /// Whether a *move* may promote depends on the destination rank and the
+    /// mover, which is legality's question.
     pub const fn promoted(self) -> Option<Self> {
         match self {
             Self::Rook => Some(Self::PromotedRook),
@@ -148,9 +138,6 @@ impl PieceKind {
 }
 
 /// A piece on the board: a kind and its owner.
-///
-/// Public fields: the two carry no invariant between them, so a constructor
-/// would add ceremony and nothing else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Piece {
     /// What the piece is.
@@ -161,10 +148,8 @@ pub struct Piece {
 
 /// A kind a hand can hold: the seven base kinds other than the King.
 ///
-/// A separate enum rather than a validated [`PieceKind`], because the issue's
-/// requirement is that a promoted piece in hand be *unrepresentable* rather
-/// than rejected at run time. [`Hand`] and [`Move::Drop`] both take this type,
-/// so there is no value to pass and therefore no check to forget.
+/// A separate enum rather than a validated [`PieceKind`], so that a promoted
+/// piece in hand is unrepresentable: a piece loses its promotion on capture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum HandKind {
     /// 飛.
@@ -197,10 +182,8 @@ impl HandKind {
 
     /// The hand kind matching `kind`, or `None` for a King or a promoted kind.
     ///
-    /// Deliberately does not demote: a captured promoted piece reverts, and
-    /// performing that reversion is move application's job. Doing it here
-    /// would hide a rule inside a conversion, where a legality test would
-    /// never look for it.
+    /// Does not demote: a captured promoted piece reverts, and performing that
+    /// reversion is move application's job.
     pub const fn from_piece_kind(kind: PieceKind) -> Option<Self> {
         match kind {
             PieceKind::Rook => Some(Self::Rook),
@@ -243,9 +226,8 @@ impl HandKind {
 
 /// Removing a piece a hand does not hold.
 ///
-/// Hand-written rather than derived through `thiserror`: `game/` names nothing
-/// outside `std` (invariant 1), which outranks the crate's usual error-type
-/// convention.
+/// Hand-written rather than derived through `thiserror`, because `game/` names
+/// nothing outside `std`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NotInHand {
     /// The kind that was asked for and is not there.
@@ -314,10 +296,9 @@ impl Hand {
 
 /// A position: the board, both hands, and whose turn it is.
 ///
-/// Structural equality over exactly those three fields. That is also what
-/// [`PositionKey`](super::repetition::PositionKey) keys on (P-6), and for the
-/// same reason: ply and clock are not part of a position's identity, since
-/// including either would mean no position ever recurs.
+/// Structural equality over exactly those three fields: ply and clock are not
+/// part of a position's identity, since including either would mean no
+/// position ever recurs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Position {
     board: [[Option<Piece>; 9]; 9],
@@ -327,13 +308,8 @@ pub struct Position {
 
 impl Position {
     /// The even starting position, Black to move.
-    ///
-    /// Hirate has exactly two legitimate homes, and this is one of them — the
-    /// point a setup sequence is replayed from. Hirate is one value of this
-    /// type and nothing branches on being it.
     pub fn hirate() -> Self {
-        /// The back rank, from file 1 to file 9. Symmetric, so both sides use
-        /// it — mirrored by the rank each is placed on.
+        /// From file 1 to file 9, symmetric, so both sides use it.
         const BACK_RANK: [PieceKind; 9] = [
             PieceKind::Lance,
             PieceKind::Knight,
@@ -374,10 +350,9 @@ impl Position {
         self.board[Self::rank_index(square)][Self::file_index(square)]
     }
 
-    /// Puts `piece` on `square`, or empties the square.
-    ///
-    /// A placement primitive, not a move: capture, promotion, and the hand
-    /// bookkeeping around them belong to move application.
+    /// Puts `piece` on `square`, or empties the square. A placement primitive,
+    /// not a move: capture, promotion and the hand bookkeeping around them
+    /// belong to move application.
     pub fn set_piece_at(&mut self, square: Square, piece: Option<Piece>) {
         self.board[Self::rank_index(square)][Self::file_index(square)] = piece;
     }
@@ -403,8 +378,7 @@ impl Position {
     }
 
     /// Placement by coordinate, for [`Position::hirate`]'s table. Every call
-    /// site passes a literal on the board, so the indexing is provably in
-    /// range; nothing reachable from client input goes through here.
+    /// site passes a literal on the board, so the indexing is in range.
     fn place(&mut self, file: u8, rank: u8, color: Color, kind: PieceKind) {
         self.board[(rank - 1) as usize][(file - 1) as usize] = Some(Piece { kind, color });
     }
@@ -420,18 +394,14 @@ impl Position {
     }
 }
 
-/// A move, as data.
-///
-/// What `StartSpec::Buoy { setup }` will hold and what legality will consume.
-/// No strings: the CSA and USI spellings of a move are edge encodings and
-/// never appear in `game/` (invariant 3).
+/// A move, as data. No strings: the CSA and USI spellings of a move stay at
+/// the codecs and never reach `game/`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Move {
     /// A piece already on the board moving, promoting or not.
     ///
     /// No piece kind: the kind is on the board at `from`, and carrying it here
-    /// would create a second source of truth that a malformed line could
-    /// disagree with.
+    /// would be a second source of truth a malformed line could disagree with.
     Board {
         /// Where the piece stands.
         from: Square,
@@ -442,8 +412,7 @@ pub enum Move {
         promote: bool,
     },
 
-    /// A piece dropped from hand. A King and a promoted kind are
-    /// unrepresentable here for the same reason they are in a [`Hand`].
+    /// A piece dropped from hand.
     Drop {
         /// What is dropped.
         piece: HandKind,
@@ -456,7 +425,6 @@ pub enum Move {
 mod tests {
     use super::*;
 
-    /// Every kind, so a test can quantify over all fourteen.
     const ALL_KINDS: [PieceKind; 14] = [
         PieceKind::King,
         PieceKind::Rook,
@@ -475,7 +443,6 @@ mod tests {
     ];
 
     fn square(file: u8, rank: u8) -> Square {
-        // The tests' own coordinates, all literal and on the board.
         Square::new(file, rank).expect("test coordinate is on the board")
     }
 
@@ -645,10 +612,8 @@ mod tests {
         assert_eq!(missing.to_string(), "no Knight in hand");
     }
 
-    /// The type-level guarantee is [`Hand::add`]'s signature: there is no
-    /// promoted [`HandKind`] to pass, so a promoted piece in hand does not
-    /// compile. This covers the conversion that could otherwise smuggle one
-    /// in — it refuses a King and every promoted kind, and does not demote.
+    /// [`Hand::add`]'s signature already refuses a promoted piece; this covers
+    /// the conversion that could otherwise smuggle one in.
     #[test]
     fn only_the_seven_base_kinds_convert_into_a_hand_kind() {
         assert_eq!(HandKind::ALL.len(), 7);
@@ -667,8 +632,6 @@ mod tests {
         }
     }
 
-    /// The full hirate layout in (file, rank) coordinates, as the issue spells
-    /// it: Black on ranks 7–9, White mirroring on ranks 1–3.
     fn hirate_layout() -> Vec<(u8, u8, Color, PieceKind)> {
         let mut expected = vec![
             (5, 9, Color::Black, PieceKind::King),
@@ -809,8 +772,7 @@ mod tests {
         }
     }
 
-    /// A `String` field would not satisfy `Copy`, so the bound is the
-    /// assertion that no wire spelling has crept into the type (invariant 3).
+    /// A `String` field would not satisfy `Copy`.
     #[test]
     fn a_move_is_a_plain_value_carrying_no_strings() {
         fn assert_copy<T: Copy>() {}

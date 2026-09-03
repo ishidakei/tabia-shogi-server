@@ -1,0 +1,37 @@
+{% extends "layout.html" %}
+
+{% block title %}参加者一覧 — tabia-shogi-server{% endblock %}
+
+{% block content %}
+<h2>参加者一覧</h2>
+
+<p class="muted">
+このサーバーで対局したことのある参加者の一覧です。
+参加者はエンジンごとに数えます (トークンが異なれば別エンジンとして扱います)。
+名前は、そのエンジンが最後に対局したときに名乗ったエンジン名です。
+</p>
+
+{% if participants.is_empty() %}
+<p class="muted">まだ対局した参加者はいません。</p>
+{% else %}
+<table>
+<thead>
+<tr><th>エンジン名</th><th>レーティング</th><th>対局数</th><th>最終対局 (UTC)</th></tr>
+</thead>
+<tbody>
+{% for participant in participants %}
+<tr>
+<td><a href="/participants/{{ participant.token_key() }}">{{ participant.display_name() }}</a></td>
+<td>
+{%- if let Some(rating) = participant.rating() -%}{{ rating }}
+{%- else -%}<span class="muted">未算定</span>
+{%- endif -%}
+</td>
+<td>{{ participant.games_played() }}</td>
+<td>{{ participant.last_ended_at() }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+{% endblock %}

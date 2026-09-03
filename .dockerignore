@@ -15,3 +15,23 @@
 # into it whichever way the matcher reads a bare directory name.
 !src
 !src/**
+
+# The schema is read at *compile* time — `sqlx::migrate!` embeds these files
+# into the binary — so a build context without them does not build. Nothing is
+# baked into the runtime image: what ships is the binary that carries them.
+!migrations
+!migrations/**
+
+# The web half's templates, on the same terms: askama expands them into
+# rendering code at compile time, so a build context without them does not
+# build, and the runtime image carries no HTML file.
+!templates
+!templates/**
+
+# Not because the release build compiles a test — it compiles none. Cargo.toml
+# declares one test target explicitly, and cargo refuses to *parse* a manifest
+# whose declared target file is missing, before it has decided which targets to
+# build at all. So a context without this directory fails at manifest parsing,
+# and `tests/docker_context.rs` is the test that holds the two lists together.
+!tests
+!tests/**

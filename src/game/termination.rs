@@ -1,27 +1,18 @@
 //! How a game ended.
 //!
-//! A game ends down one path and one path only, so the three-line termination
-//! sequence cannot be got right in one case and wrong in another.
-//! [`Outcome`] is what that path carries.
-//!
-//! Deliberately no mapping to the protocol's reason and result lines: those
-//! types live in `csa`, and naming one here would run invariant 1 backwards.
-//! The doc comments name each end status so the correspondence is readable,
-//! and a session slice makes the connection.
+//! No mapping to the protocol's reason and result lines: those types live in
+//! `csa`, and naming one here would point `game/` outwards. The doc comments
+//! name each end status so the correspondence is readable.
 
 use super::position::Color;
 
-/// The eight ways a game ends, exactly as P-7 enumerates them.
+/// The nine ways a game ends: the protocol's eight, and the server's own abort.
 ///
-/// A sum type rather than a struct with optional fields: an end state the code
-/// fails to handle is then a compile error rather than a hung game.
-///
-/// **`%CHUDAN` has no variant of its own.** Suspension is not implemented, and
-/// "not supported" has an exact shape rather than a silence: the reference
-/// classes `%CHUDAN` as an ordinary special move, fails to match it against
-/// `%KACHI` or `%TORYO`, falls through to `:illegal`, and ends the game against
-/// the sender. So an in-game `%CHUDAN` ends here as [`Outcome::IllegalMove`]
-/// against whoever sent it, adding no end state to this list (P-7).
+/// `%CHUDAN` has no variant of its own. Suspension is not implemented, and the
+/// reference classes `%CHUDAN` as an ordinary special move, fails to match it
+/// against `%KACHI` or `%TORYO`, falls through to `:illegal`, and ends the
+/// game against the sender. So an in-game `%CHUDAN` ends here as
+/// [`Outcome::IllegalMove`] against whoever sent it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Outcome {
     /// `%TORYO` — the named side resigned. Reason `#RESIGN`.
@@ -62,28 +53,46 @@ pub enum Outcome {
         by: Color,
     },
 
-    /// The absolute move limit was reached. Reason `#MAX_MOVES`.
+    /// The absolute move limit was reached. Reason `#MAX_MOVES`, and the one
+    /// termination whose last line is not a result: the specification fixes
+    /// both lines (v1.2.1 section 3.4).
     ///
-    /// Scored a **draw**, following shogi-server (`GameResultMaxMovesDraw`):
-    /// the specification lists the status without fixing the result, so the
-    /// reference implementation governs (P-7).
+    /// Scored a draw all the same, following shogi-server
+    /// (`GameResultMaxMovesDraw`), since the specification fixes what is sent
+    /// without fixing the result. The record, the row and the log say draw;
+    /// only the wire differs.
     MaxMoves,
 
-    /// The named side's connection dropped. Reason `#CENSORED`, and no echo
-    /// line: no move or declaration was received.
+    /// The named side's connection dropped. Terminated as a resignation by it —
+    /// a `%TORYO` the server writes, `#RESIGN`, and the result — following
+    /// shogi-server's `GameResultAbnormalWin`. Distinct from
+    /// [`Resignation`](Self::Resignation) even so: the record says `abnormal`
+    /// and the row and the log say `DISCONNECT`, because nothing was received.
     Disconnected {
         /// The side that went away.
         by: Color,
     },
+
+    /// The server broke the game off. Reason `#CHUDAN`, and the one outcome
+    /// with no winner and no draw either.
+    ///
+    /// Not a client's `%CHUDAN` — that is still an illegal move by whoever
+    /// sent it, and this variant is unreachable from anything a client can
+    /// write. It is reached from one place only: the matchmaker aborting a
+    /// preset-vs-preset game to free a slot for an engine that is not the
+    /// server's own.
+    ///
+    /// It names no side because neither side did anything: the game is scored
+    /// as no result at all — `none` in the row, and so out of the rating fit —
+    /// rather than as a draw, which would be evidence the game never produced.
+    Aborted,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// One value per variant. Paired with the exhaustive match below: the
-    /// array proves eight exist, and the match proves there is no ninth.
-    const ALL: [Outcome; 8] = [
+    const ALL: [Outcome; 9] = [
         Outcome::Resignation { by: Color::Black },
         Outcome::Declaration {
             by: Color::Black,
@@ -95,18 +104,19 @@ mod tests {
         Outcome::PerpetualCheck { by: Color::Black },
         Outcome::MaxMoves,
         Outcome::Disconnected { by: Color::Black },
+        Outcome::Aborted,
     ];
 
     #[test]
-    fn there_are_exactly_eight_outcomes() {
-        assert_eq!(ALL.len(), 8);
+    fn there_are_exactly_nine_outcomes() {
+        assert_eq!(ALL.len(), 9);
         for (i, a) in ALL.iter().enumerate() {
             for b in &ALL[i + 1..] {
                 assert_ne!(a, b, "{a:?} and {b:?} are the same outcome");
             }
         }
 
-        // A ninth variant breaks this arm list rather than passing unnoticed.
+        // A tenth variant breaks this arm list rather than passing unnoticed.
         for outcome in ALL {
             match outcome {
                 Outcome::Resignation { by: _ }
@@ -116,7 +126,8 @@ mod tests {
                 | Outcome::Repetition
                 | Outcome::PerpetualCheck { by: _ }
                 | Outcome::MaxMoves
-                | Outcome::Disconnected { by: _ } => {}
+                | Outcome::Disconnected { by: _ }
+                | Outcome::Aborted => {}
             }
         }
     }
@@ -174,22 +185,20 @@ mod tests {
         );
     }
 
-    /// The drawn outcomes name no side, so there is no loser to read out of
-    /// them by mistake.
     #[test]
-    fn the_drawn_outcomes_name_no_side() {
-        let unit = [Outcome::Repetition, Outcome::MaxMoves];
+    fn the_outcomes_with_no_loser_name_no_side() {
+        let unit = [Outcome::Repetition, Outcome::MaxMoves, Outcome::Aborted];
         for (i, a) in unit.iter().enumerate() {
             for b in &unit[i + 1..] {
                 assert_ne!(a, b);
             }
         }
 
-        // Matching each with no field binding is what stops one of them from
-        // gaining a `by` later: it would no longer compile.
+        // Matching each with no field binding stops one of them from gaining a
+        // `by` later.
         for outcome in unit {
             match outcome {
-                Outcome::Repetition | Outcome::MaxMoves => {}
+                Outcome::Repetition | Outcome::MaxMoves | Outcome::Aborted => {}
                 other => panic!("{other:?} is not a unit variant"),
             }
         }

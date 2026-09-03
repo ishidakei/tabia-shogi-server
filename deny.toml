@@ -1,0 +1,101 @@
+# cargo-deny configuration — the supply-chain gate.
+#
+# `cargo deny check` runs all four checks below and is one of the quality gates
+# every change to this repository runs. The advisories check is the reason it
+# is here: this is a network server meant to face the public internet, so a
+# RustSec entry against anything in the dependency graph has to fail a gate
+# rather than wait for someone to notice.
+#
+# Nothing here is pinned to a target triple. The server itself is Linux-only,
+# but leaving the graph unfiltered means an advisory is never skipped because a
+# crate happens to be reached through a `cfg(windows)` edge; the cost is a few
+# `windows-*` crates in the licence tally, all of them MIT/Apache-2.0.
+
+[graph]
+# Dev-dependencies are part of what a contributor's machine executes, so they
+# are audited too. `all-features` matches the gate commands, which all run with
+# `--all-features`; without it the `fault-injection` graph would go unchecked.
+all-features = true
+
+[advisories]
+# The RustSec database. Vulnerabilities and unmaintained-crate warnings both
+# come from here; a yanked release is cargo's own signal and is treated the
+# same way.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# Empty by design. An entry here silences one advisory id, and every one of
+# them needs a comment saying who accepted the risk and why — an unexplained
+# ignore is how a known vulnerability becomes permanent.
+ignore = []
+
+[licenses]
+# Enumerated from the actual dependency tree (`cargo deny --all-features list`),
+# not copied from a template: every licence below is one some crate in this
+# graph is actually distributed under.
+#
+# This server is distributed under GPL-3.0-only, so the test each entry has to
+# pass is "may GPL-3.0 code link against it and be redistributed". All of these
+# are permissive and GPLv3-compatible:
+#
+#   Apache-2.0          most of the ecosystem, dual-licensed with MIT
+#   MIT                 likewise
+#   BSD-3-Clause        matchit, subtle
+#   BSL-1.0             ryu (also Apache-2.0, kept for the crates that offer it alone)
+#   CDLA-Permissive-2.0 webpki-roots — see below
+#   ISC                 ring, rustls-webpki, untrusted — the TLS stack
+#   Unicode-3.0         the icu_* crates that idna pulls in through url
+#   Unlicense           memchr
+#   Zlib                foldhash, hashbrown's default hasher
+#
+# CDLA-Permissive-2.0 is the odd one and is here for exactly one crate.
+# `webpki-roots` ships Mozilla's root certificate store — *data*, not code — and
+# the Community Data License Agreement Permissive 2.0 is the licence Mozilla
+# publishes that store under. It is permissive in the plain sense: it grants
+# unrestricted use, modification and redistribution of the data, and the only
+# condition it attaches is that the disclaimer text travels with a redistributed
+# copy. It imposes nothing GPL-3.0-only cannot satisfy, and it reaches this graph
+# through `reqwest`'s `rustls-tls`, which is how the GitHub OAuth exchange
+# verifies github.com. The alternative — `rustls-tls-native-roots` — trades this
+# entry for seven crates and a runtime dependency on whatever trust store the
+# host image carries, which is the weaker answer for an image that is meant to be
+# an artifact of a revision.
+#
+# GPL-3.0-only is this crate's own licence: cargo-deny checks the workspace
+# member alongside its dependencies, so the allowlist has to name it.
+#
+# A copyleft licence that is NOT GPLv3-compatible must never be added here. If a
+# new dependency needs one, the dependency is the thing to change.
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "GPL-3.0-only",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+# The default. A licence file that matches a known text less closely than this
+# is reported rather than guessed at.
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate major versions are a fact of any real graph (windows-sys 0.52 and
+# 0.61 are both here through transitive edges nobody in this repository
+# controls), so this warns rather than denies: it is a nudge to unify when the
+# upstreams do, not a gate.
+multiple-versions = "warn"
+# A `"*"` requirement means the build is not reproducible from Cargo.toml alone.
+# There are none, and there should stay none.
+wildcards = "deny"
+
+[sources]
+# crates.io and nothing else. A git dependency — even a legitimate fork — would
+# be code that no registry ever published and no `cargo audit` ever sees, so it
+# has to be a deliberate edit to this file rather than a quiet addition to
+# Cargo.toml.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

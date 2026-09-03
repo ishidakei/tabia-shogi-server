@@ -1,18 +1,12 @@
 //! End to end: the clock, over real sockets.
 //!
-//! P-5's deadline is the one rule of this server that no client action reveals.
-//! Every other termination is a reply to something that arrived; this one has to
-//! happen when **nothing** arrives, which is why it is tested here rather than
-//! only where the arithmetic is. What these tests assert is the wiring: that a
+//! Every other termination is a reply to something that arrived; a deadline has
+//! to happen when nothing arrives. What these tests assert is the wiring: that a
 //! deadline is armed from the right number, measured from the right instant,
 //! rearmed as the game moves, and dropped when the game ends.
 //!
-//! **Milliseconds, not minutes.** `Time_Unit: 1msec` exists for exactly this,
-//! and byoyomi and total values of a few hundred units keep every scenario below
-//! to a fraction of a second of wall time. `tests/full_game.rs` runs its games
-//! at `total = 600` seconds, where the timer added here never fires — that suite
-//! is this one's regression guard, since arming a deadline must break nothing
-//! about a game played inside it.
+//! `Time_Unit: 1msec` with byoyomi and total values of a few hundred units keeps
+//! every scenario below to a fraction of a second of wall time.
 
 mod common;
 
@@ -25,10 +19,8 @@ use common::{Client, config_text_with_time, one_game, seated, start, start_defau
 /// How much later than the computed instant a flag may arrive.
 ///
 /// Every timing assertion below is two-sided: a lower bound taken before the
-/// clock could have started, which is what proves the server waited out the
-/// allowance rather than flagging early, and an upper bound of the deadline plus
-/// this — generous against a loaded machine, and still far short of the next
-/// deadline any of these configurations would produce.
+/// clock could have started, which says the server waited out the allowance
+/// rather than flagging early, and an upper bound of the deadline plus this.
 const TOLERANCE: Duration = Duration::from_millis(750);
 
 /// How long a test waits to be convinced that nothing is coming.
@@ -38,15 +30,14 @@ const QUIET: Duration = Duration::from_millis(800);
 
 /// A collection whose one entry is a twenty-ply opening line.
 ///
-/// M2's transmitted shape at its full size: the go/no-go gate asks for a setup
-/// of at least twenty moves, and this is that setup. An ordinary opening rather
-/// than five king-shuttle cycles — both are legal and P-6 is not yet
-/// implemented, but a test outlives the milestone that would make the shuttle a
-/// repetition draw.
+/// The largest transmitted setup this server is expected to put on the wire. An
+/// ordinary opening rather than five king-shuttle cycles: both are legal, but
+/// the shuttle would make this game a repetition draw.
 const TWENTY_PLY_OPENING: &str = "position startpos moves \
 7g7f 3c3d 2g2f 4c4d 5g5f 5c5d 1g1f 1c1d 9g9f 9c9d \
 3i4h 7a6b 6i7h 4a3b 4i5h 6a5b 2f2e 2b3c 5i6i 5a4b\n";
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_silent_player_flags_and_both_clients_are_told() {
     // Four hundred milliseconds, no byoyomi and no increment, so the whole of
@@ -56,6 +47,7 @@ async fn a_silent_player_flags_and_both_clients_are_told() {
             "\
 time_unit = \"1msec\"
 total = 400
+increment = 0
 least_time_per_move = 0
 roundup = false",
         ),
@@ -91,6 +83,7 @@ roundup = false",
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn an_untimed_game_arms_no_deadline_at_all() {
     // `total = 0` with no byoyomi and no increment: shogi-server's guard makes
@@ -101,6 +94,7 @@ async fn an_untimed_game_arms_no_deadline_at_all() {
             "\
 time_unit = \"1msec\"
 total = 0
+increment = 0
 least_time_per_move = 0
 roundup = false",
         ),
@@ -127,6 +121,7 @@ roundup = false",
     }
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn byoyomi_sustains_a_game_whose_total_is_exhausted_and_silence_ends_it() {
     // A clock that starts empty, with a second of byoyomi behind it: every turn
@@ -138,6 +133,7 @@ async fn byoyomi_sustains_a_game_whose_total_is_exhausted_and_silence_ends_it() 
 time_unit = \"1msec\"
 total = 0
 byoyomi = 1000
+increment = 0
 least_time_per_move = 0
 roundup = false",
         ),
@@ -153,9 +149,8 @@ roundup = false",
 
     let mut game = start_game(seats.into_iter().collect()).await;
 
-    // Four turns, each answered at once and so well inside the byoyomi. The
-    // deadline is rearmed from each relay, which is what keeps the game alive
-    // past the first second.
+    // Four turns, each answered at once and so well inside the byoyomi: the
+    // deadline is rearmed from each relay.
     for (side, text) in [
         (Side::Black, "+7776FU"),
         (Side::White, "-3334FU"),
@@ -168,9 +163,8 @@ roundup = false",
         };
         mover.send(text).await;
 
-        // Relayed to both, so the byoyomi held for every one of them. The
-        // charge itself is a real measurement and no test can pin it; that it
-        // is a charge on *this* move is what the relay says.
+        // The charge is a real measurement no test can pin; that it is a charge
+        // on this move is what the relay says.
         for client in [&mut game.black, &mut game.white] {
             let relayed = client.line().await;
             charged_in(&relayed, text);
@@ -198,10 +192,10 @@ roundup = false",
     );
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_resignation_in_a_timed_game_never_becomes_a_time_up() {
-    // The armed deadline dies with the game: an ordinary termination is reached
-    // first, and nothing further is written on its account.
+    // The armed deadline dies with the game.
     let server = start_default().await;
     let mut game = one_game(&server).await;
 
@@ -221,8 +215,9 @@ async fn a_resignation_in_a_timed_game_never_becomes_a_time_up() {
     }
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
-async fn an_even_position_under_an_asymmetric_allowance_transmits_and_plays() {
+async fn a_designated_position_under_an_asymmetric_allowance_transmits_and_plays() {
     // Nine hundred seconds each, White reduced by six hundred of them, and a
     // two-second increment for the T-values to cancel against: the `T602` shape
     // over a twenty-ply setup.
@@ -293,8 +288,7 @@ enum Side {
 /// The `T` value a relay of `text` carries, asserting that it is one.
 ///
 /// A charge measured over a real socket is not a number a test can predict, so
-/// what is asserted here is its shape and what it is a charge *on*; a caller
-/// that has a bound for it applies its own.
+/// what is asserted here is its shape and what it is a charge on.
 fn charged_in(relayed: &str, text: &str) -> u128 {
     let expected = format!("{text},T");
     let charged = relayed

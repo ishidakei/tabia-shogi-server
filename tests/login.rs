@@ -1,4 +1,4 @@
-//! P-1 at the socket: what a `LOGIN` gets, and what closes a connection.
+//! The login at the socket: what a `LOGIN` gets, and what closes a connection.
 //!
 //! The pure decision has its own tests in `session/login.rs`; these are the
 //! parts only a real connection can show — that a rejection also *closes*, that
@@ -10,6 +10,7 @@ mod common;
 
 use common::{Client, config_text, start, start_default};
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_malformed_login_is_answered_and_the_connection_closes() {
     let server = start_default().await;
@@ -23,13 +24,14 @@ async fn a_malformed_login_is_answered_and_the_connection_closes() {
     client.expect_closed().await;
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_new_login_on_a_waiting_session_token_replaces_it() {
     let server = start_default().await;
     let mut old = Client::connect(server.local_addr()).await;
     old.login("first", "shared-token").await;
 
-    // P-1: the new login is accepted and the old session killed when the token
+    // The new login is accepted and the old session killed when the token
     // is valid and the old session is not in a game.
     let mut new = Client::connect(server.local_addr()).await;
     new.login("second", "shared-token").await;
@@ -37,6 +39,7 @@ async fn a_new_login_on_a_waiting_session_token_replaces_it() {
     old.expect_closed().await;
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_new_login_on_a_token_in_a_game_is_rejected_and_the_game_plays_on() {
     let server = start_default().await;
@@ -54,12 +57,13 @@ async fn a_new_login_on_a_token_in_a_game_is_rejected_and_the_game_plays_on() {
     white.expect("+7776FU,T1").await;
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn an_extension_command_warns_and_leaves_the_connection_usable() {
     let server = start_default().await;
     let mut client = Client::connect(server.local_addr()).await;
 
-    // Q7: recognized, never implemented, and explicitly not a transition — so
+    // Recognized, never implemented, and explicitly not a transition — so
     // the connection is still in `Connected` and can still log in.
     client.send("%%WHO").await;
     client.expect("##[WARN] unknown command: %%WHO").await;
@@ -67,6 +71,7 @@ async fn an_extension_command_warns_and_leaves_the_connection_usable() {
     client.login("engine", "token").await;
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn repeated_malformed_lines_close_the_connection_and_commands_do_not_count() {
     let server = start(&config_text(3, 1), common::HIRATE).await;
@@ -85,7 +90,7 @@ async fn repeated_malformed_lines_close_the_connection_and_commands_do_not_count
 }
 
 /// Two logged-in clients, paired and playing, returned as `(black, white)`.
-async fn paired(server: &tabia_shogi_server::session::Server) -> (Client, Client) {
+async fn paired(server: &tabia_shogi_server::Running) -> (Client, Client) {
     let mut first = Client::connect(server.local_addr()).await;
     first.login("black-engine", "black-token").await;
     let mut second = Client::connect(server.local_addr()).await;

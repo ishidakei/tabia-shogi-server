@@ -1,0 +1,92 @@
+{% extends "layout.html" %}
+
+{% block title %}トークン — tabia-shogi-server{% endblock %}
+
+{% block content %}
+<h2>トークン</h2>
+
+{% if let Some(caps) = list.caps() %}
+<p class="muted">
+アクティブ {{ list.active() }} / {{ caps.active }}、
+発行累計 {{ list.lifetime() }} / {{ caps.lifetime }}。
+失効させるとアクティブの枠は空きますが、発行累計の枠は空きません。
+</p>
+{% else %}
+<p class="muted">
+アクティブ {{ list.active() }}、発行累計 {{ list.lifetime() }}。
+管理者のアカウントには、発行の本数の上限 (<code>[accounts]</code>) はどちらも適用されません。
+アクティブも発行累計も上限なく発行できます。
+</p>
+{% endif %}
+
+{% if list.tokens().is_empty() %}
+<p class="muted">まだトークンを発行していません。</p>
+{% else %}
+<table>
+<thead>
+<tr><th>エンジン名</th><th>レーティング</th><th>発行 (UTC)</th><th>状態</th><th></th></tr>
+</thead>
+<tbody>
+{% for token in list.tokens() %}
+<tr>
+<td>
+{%- if let Some(name) = token.display_name() -%}{{ name }}
+{%- else -%}<span class="muted">未使用</span>
+{%- endif -%}
+</td>
+<td>
+{%- if let Some(rating) = token.rating() -%}{{ rating }}
+{%- else -%}<span class="muted">未算定</span>
+{%- endif -%}
+{%- if let Some(provisional) = token.provisional_rating() %}
+<span class="muted">(仮 {{ provisional }})</span>
+{%- endif -%}
+</td>
+<td>{{ token.issued_at() }}</td>
+<td>
+{%- if token.is_active() -%}有効
+{%- else -%}<span class="muted">失効</span>
+{%- endif -%}
+</td>
+<td>
+{% if token.is_active() %}
+<form method="post" action="/tokens/revoke">
+<input type="hidden" name="token" value="{{ token.id() }}">
+<button type="submit">失効させる</button>
+</form>
+{% endif %}
+</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+
+<h2>新しいトークンを発行する</h2>
+
+{% if list.can_issue() %}
+<p>発行したトークンの値はこのとき 1 回だけ表示します。サーバーはハッシュしか保存しないので、後から見ることはできません。</p>
+<form method="post" action="/tokens/issue">
+{% if let Some(bound) = list.bound() %}
+<p>
+<label for="provisional_rating">仮のレーティング (省略可、{{ bound }} 以下)</label>
+<input type="text" id="provisional_rating" name="provisional_rating" value="" inputmode="numeric">
+</p>
+{% endif %}
+<button type="submit">発行する</button>
+</form>
+{% else %}
+{% if let Some(caps) = list.caps() %}
+<p class="muted">
+上限に達しているため、いまは発行できません。
+{% if list.lifetime() >= caps.lifetime %}
+発行累計が上限 {{ caps.lifetime }} に達しています。失効させても発行累計の枠は空きません。
+{% else %}
+アクティブなトークンが上限 {{ caps.active }} に達しています。どれか 1 つを失効させると、次の発行ができます。
+{% endif %}
+</p>
+{% endif %}
+{% endif %}
+
+<p><a href="/account">アカウントのページ</a></p>
+{% endblock %}

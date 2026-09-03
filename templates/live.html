@@ -1,0 +1,60 @@
+{% extends "layout.html" %}
+
+{% block title %}{{ game.game_id() }} (対局中) — tabia-shogi-server{% endblock %}
+
+{% block content %}
+<h2>{{ game.game_id() }} <span class="muted">対局中</span></h2>
+<dl>
+<dt>先手</dt><dd>{{ game.black_name() }} — 残り {{ game.black_clock() }}</dd>
+<dt>後手</dt><dd>{{ game.white_name() }} — 残り {{ game.white_clock() }}</dd>
+<dt>開始 (UTC)</dt><dd>{{ game.started_at() }}</dd>
+<dt>手数</dt><dd>{{ game.ply() }}</dd>
+<dt>最終手</dt>
+<dd>
+{%- if let Some(last) = game.last_move() -%}{{ last }}
+{%- else -%}まだ指されていません
+{%- endif -%}
+</dd>
+<dt>手番</dt>
+<dd>
+{%- if game.board().black_to_move() -%}先手
+{%- else -%}後手
+{%- endif -%}
+</dd>
+</dl>
+
+<table class="board">
+<tbody>
+{% for row in game.board().rows() %}
+<tr>
+{% for cell in row.cells() %}
+{%- if cell.is_occupied() -%}
+<td class="{% if cell.is_black() %}black{% else %}white{% endif %}">{{ cell.text() }}</td>
+{%- else -%}
+<td class="empty">.</td>
+{%- endif -%}
+{% endfor %}
+</tr>
+{% endfor %}
+</tbody>
+</table>
+
+<dl>
+<dt>先手の持駒</dt>
+<dd class="hand">
+{%- if game.board().black_hand().is_empty() -%}なし
+{%- else -%}{{ game.board().black_hand() }}
+{%- endif -%}
+</dd>
+<dt>後手の持駒</dt>
+<dd class="hand">
+{%- if game.board().white_hand().is_empty() -%}なし
+{%- else -%}{{ game.board().white_hand() }}
+{%- endif -%}
+</dd>
+</dl>
+
+<p class="muted">
+このページは自動更新しません。再読み込みすると、その時点の局面になります。
+</p>
+{% endblock %}

@@ -1,0 +1,97 @@
+{% extends "layout.html" %}
+
+{% block title %}指定レート — tabia-shogi-server{% endblock %}
+
+{% block content %}
+<h2>指定レート</h2>
+
+<p class="muted">
+指定レートは、レートの絶対的な数値を決めるための基準値です。
+指定レートを与えたエンジンも、表に出るのは算定した値で、指定レートが算定に入ることはありません。
+ここで設定できるのはプリセットエンジン以外のエンジンです。
+プリセットエンジンの指定レートは設定ファイルで決めます。
+</p>
+
+<p class="muted">
+ここでの追加・変更・削除は、次回のレーティングの更新から反映されます。サーバーの再起動は要りません。
+</p>
+
+{% if let Some(refusal) = refusal %}
+{% match refusal %}
+{% when DesignationRefusal::NotAParticipantId %}
+<p>設定できません。参加者 ID は 64 文字の小文字 16 進数です。このページの表の行から保存してください。</p>
+{% when DesignationRefusal::PresetEngine %}
+<p>設定できません。その参加者 ID はプリセットエンジンのものです。プリセットエンジンの指定レートは設定ファイル (<code>[matchmaking]</code> の <code>preset_engine_tokens</code> の <code>rating</code>) で決めます。</p>
+{% when DesignationRefusal::RatingNotANumber %}
+<p>設定できません。指定レートは整数で書きます。</p>
+{% endmatch %}
+{% endif %}
+
+<h2>いま設定している指定レート</h2>
+
+{% if view.entries().is_empty() %}
+<p class="muted">まだ 1 つも設定していません。指定レートを持つエンジンが 1 つもない間、レーティング表は既定の値を平均とするグループを載せます。</p>
+{% else %}
+<p class="muted">指定レートの欄を空にして保存すると、そのエンジンの指定レートを削除します。</p>
+<table>
+<thead>
+<tr><th>エンジン名</th><th>参加者 ID</th><th>指定レート</th><th>設定者</th><th>設定日時 (UTC)</th></tr>
+</thead>
+<tbody>
+{% for entry in view.entries() %}
+<tr>
+<td>
+{%- if let Some(name) = entry.display_name() -%}{{ name }}
+{%- else -%}<span class="muted">対局なし</span>
+{%- endif -%}
+</td>
+<td><a href="/participants/{{ entry.token_key() }}">{{ entry.token_key() }}</a></td>
+<td>
+<form method="post" action="/admin/ratings/designate">
+<input type="hidden" name="participant" value="{{ entry.token_key() }}">
+<input type="text" name="rating" value="{{ entry.rating() }}" inputmode="numeric" size="8">
+<button type="submit">保存する</button>
+</form>
+</td>
+<td>{{ entry.designated_by() }}</td>
+<td>{{ entry.designated_at() }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+
+<h2>指定レートを与えられるエンジン</h2>
+
+<p class="muted">
+このサーバーで対局を終えたエンジンのうち、プリセットエンジンでなく、まだ指定レートを持たないものです。
+指定レートを書いて保存すると、そのエンジンの指定レートになります。
+</p>
+
+{% if view.candidates().is_empty() %}
+<p class="muted">いまはありません。対局を終えたエンジンがまだないか、そのすべてに指定レートを与えています。</p>
+{% else %}
+<table>
+<thead>
+<tr><th>エンジン名</th><th>参加者 ID</th><th>指定レート</th></tr>
+</thead>
+<tbody>
+{% for candidate in view.candidates() %}
+<tr>
+<td>{{ candidate.display_name() }}</td>
+<td><a href="/participants/{{ candidate.token_key() }}">{{ candidate.token_key() }}</a></td>
+<td>
+<form method="post" action="/admin/ratings/designate">
+<input type="hidden" name="participant" value="{{ candidate.token_key() }}">
+<input type="text" name="rating" value="" inputmode="numeric" size="8">
+<button type="submit">設定する</button>
+</form>
+</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% endif %}
+
+<p><a href="/ratings">レーティングの表</a> · <a href="/account">アカウントのページ</a></p>
+{% endblock %}

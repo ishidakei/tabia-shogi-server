@@ -1,23 +1,115 @@
 [package]
 name = "tabia-shogi-server"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
 
+# Off by default, and nothing in the dependency graph turns it on: `cargo build
+# --release` compiles neither `src/fault.rs` nor any call to it. It exists so
+# that `tests/panic_containment.rs` can make one task panic on purpose, which is
+# the only way to assert that a panic stays inside the task it happened in. A
+# `#[cfg(test)]` hook would not do: an integration test links this library as an
+# ordinary consumer, and cannot see one.
+[features]
+fault-injection = []
+
+# The one test that needs a panic it can aim. Declared with the feature it needs
+# rather than gated from the inside, so `cargo test` on the default features
+# does not compile a file whose every line would be behind one `cfg`.
+[[test]]
+name = "panic_containment"
+required-features = ["fault-injection"]
+
 [dependencies]
+# `config` is left off: it reads an `askama.toml` this project does not have.
+# `urlencode` is the filter the list's cursor link goes through. A template is
+# compiled into the binary, so a page that names a field no view model has fails
+# the build rather than at the request that renders it — which is the whole
+# reason this crate is here rather than a runtime templater.
+askama = { version = "0.16", default-features = false, features = [
+    "derive",
+    "std",
+    "urlencode",
+] }
+# The web half's HTTP, on the same runtime as the CSA listener: one process,
+# two listeners. `http1` is the protocol a browser reaches this over, `tokio`
+# is what `axum::serve` needs, and `query` is the `?before=` cursor.
+# `matched-path` is what lets the catch-panic layer log the route template
+# rather than the path one request happened to arrive on. `form` is how the two
+# token pages read their `POST` bodies — an HTML form with no JavaScript
+# is the whole of what those pages are, and `serde_urlencoded` is already in the
+# tree for `query`, so the feature adds a decoder rather than a dependency. No
+# `json` and no `multipart`: nothing here reads either.
+axum = { version = "0.8", default-features = false, features = [
+    "form",
+    "http1",
+    "matched-path",
+    "query",
+    "tokio",
+] }
+# The global allocator, installed in `src/lib.rs`. This is one long-running
+# multi-threaded process — the CSA listener, the web half and SQLite share a
+# runtime — and every connection task allocates on whatever the global allocator
+# is. glibc malloc serializes on a per-arena lock under that shape and fragments
+# over the multi-day uptimes this server is meant to hold; mimalloc gives each
+# thread its own heap, so the hot path takes no cross-thread lock. Default
+# features: the `secure` hardening build stays off, because the reason this
+# crate is here is throughput and fragmentation and nothing in the threat model
+# leans on heap hardening.
+mimalloc = "0.1"
 rand = { version = "0.10", default-features = false, features = ["sys_rng"] }
+# The GitHub OAuth exchange, and the only outbound HTTP this server makes:
+# one POST for the access token and one GET for the user. `default-features =
+# false` drops `default-tls`, so native-tls and OpenSSL never enter the tree;
+# `rustls-tls` is the same rustls the CSA listener already links, and its
+# webpki-roots trust anchors are pinned by Cargo.lock rather than taken from
+# whatever trust store the host image happens to carry — an image is an artifact
+# of a revision. `json` is how the two GitHub responses are read; it brings
+# `serde_json`, which is the one decoder in the tree that can take a body this
+# server did not write. `charset`, `http2` and `system-proxy` are off: the two
+# requests are ASCII JSON over HTTP/1.1 to a host named in the source, and a
+# server that quietly routed its OAuth exchange through a proxy variable in its
+# environment is not a thing this design wants.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
 # `all` is what exposes `TCP_QUICKACK`: std has no accessor for it, and socket2
 # gates every platform-specific option behind that one feature.
 socket2 = { version = "0.6", features = ["all"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = { version = "0.11", default-features = false }
+# `default-features = false` drops the drivers this server has no database for
+# and the TLS stack a local file needs none of. `sqlite` is the bundled build:
+# SQLite's amalgamation is compiled in, so the image carries no libsqlite3 and
+# a build cannot pick up whatever version the host happens to ship. `macros` is
+# here for `sqlx::migrate!` alone — every query in this crate is
+# runtime-checked (`sqlx::query`), so the build needs no `DATABASE_URL` and no
+# offline metadata directory.
+sqlx = { version = "0.8", default-features = false, features = [
+    "macros",
+    "migrate",
+    "runtime-tokio",
+    "sqlite",
+] }
 subtle = { version = "2.6", default-features = false }
 thiserror = "2"
+# `process` is the preset-engine supervisor's: the server starts and stops
+# the preset engines itself, as child processes it owns, so a preset is never
+# left running with nothing to play.
+#
+# `signal` is what the binary stops on. It is a separate feature from `process`
+# — which needs the child-reaping half of the same machinery but exposes no
+# module — and it brings `tokio::signal::unix`, which is the whole of what is
+# used: this server's supported platform is Linux, so the portable wrapper and
+# its Windows half are not compiled.
 tokio = { version = "1", features = [
     "io-util",
     "macros",
     "net",
+    "process",
     "rt-multi-thread",
+    "signal",
     "sync",
     "time",
 ] }
@@ -29,11 +121,60 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
     "ring",
     "tls12",
 ] }
-toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
+# `display` as well as `parse`: the record sidecar is a TOML document this
+# server writes and reads back, and serializing it through serde is what keeps
+# an engine name with a quote in it from producing a file that will not parse.
+toml = { version = "1", default-features = false, features = [
+    "display",
+    "parse",
+    "serde",
+    "std",
+] }
+# The `Layer` and `Service` traits, and nothing else: no feature is on, so this
+# is two trait re-exports from `tower-layer` and `tower-service`, both of which
+# axum already brings. `web/panics.rs` implements both by hand, because the
+# handler tower-http's catch-panic layer holds cannot see the request and the
+# route has to reach it somehow.
+tower = { version = "0.5", default-features = false }
+# One layer, `catch-panic`, and `default-features = false` so that none of the
+# other twenty comes with it: this crate is here because hyper turns a panicking
+# service future into a closed connection rather than a status, and the web half
+# has no supervisor of its own to notice. Everything else this project would
+# reach for in a middleware — the tracing span, a timeout — is either already
+# written here or not wanted.
+tower-http = { version = "0.6", default-features = false, features = [
+    "catch-panic",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+# One call, `kill`, in `tests/signals.rs`: the test that says the binary stops on
+# a signal has to send a real one to a real process. Nothing new enters the
+# graph — libc is already under tokio and mimalloc, and Cargo unifies it — and
+# the alternative would be shelling out to `kill(1)`, which makes the test depend
+# on a binary in `PATH` rather than on a syscall.
+libc = "0.2"
+# Property-based testing for the two layers that consume input nobody here
+# wrote: the CSA parser, which reads bytes off a socket, and the rules, which
+# read whatever that parser resolved. `~1.11` rather than the caret the rest of
+# this file uses: a minor release of proptest can change which cases a strategy
+# generates, and a randomized gate that silently changes what it covers is worth
+# pinning tighter than a library whose API is the only thing that matters.
+#
+# `default-features = false` drops `fork` and `timeout`, which exist to run each
+# case in a subprocess so a case that aborts or hangs can be reported. Nothing
+# here aborts — the properties are about a return value, not about surviving —
+# and the pair costs `rusty-fork`, `tempfile`, `fastrand` and `libc` in a graph
+# `cargo deny` audits. `std` is what makes a panicking case a shrunk failure
+# report rather than a bare unwind, `handle-panics` keeps the default panic
+# hook from printing once per shrink step, and `bit-set` is what the sampling
+# strategies index with.
+proptest = { version = "~1.11", default-features = false, features = [
+    "bit-set",
+    "handle-panics",
+    "std",
+] }
 # The test certificate is generated per run rather than checked in, so there is
 # no file that can expire. `ring` for the same reason as `tokio-rustls` above.
 rcgen = { version = "0.14", default-features = false, features = [
@@ -41,6 +182,18 @@ rcgen = { version = "0.14", default-features = false, features = [
     "pem",
     "ring",
 ] }
+# One integration test has to arrange a *failing* insert at the end of a game,
+# which means reaching the database directly rather than through the repository
+# whose failure is under test. Cargo unifies these features with the dependency
+# above, so this compiles nothing extra.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+] }
+# `ServiceExt::oneshot`, which is how the router is driven without binding a
+# listener: a route test that had to connect to a port would be testing the
+# port. axum already depends on `tower`, so this compiles nothing extra.
+tower = { version = "0.5", default-features = false, features = ["util"] }
 # `test-util` is a dev-dependency only: it is what `#[tokio::test(start_paused =
 # true)]` needs to drive the deadline's clock deterministically, and it must not
 # reach the built server, where a pausable clock would be a way for time to stop.

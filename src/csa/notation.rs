@@ -1,42 +1,22 @@
 //! CSA move notation: one line's move text to a [`Move`] and back.
 //!
-//! The bridge between the text [`super::Command::Move`] carries and the move
-//! the rules consume. Syntax and resolution only — whether the resolved move is
-//! *legal* is `game::legality`'s question, and the `,T` suffix is
-//! `csa/response.rs`'s.
+//! Syntax and resolution only — whether the resolved move is legal is
+//! `game::legality`'s question, and the `,T` suffix is `csa/response.rs`'s.
 //!
-//! The grammar is the CSA standard kifu move format the specification uses in
-//! its own examples (v1.2.1 §3, `+7776FU` client-sent and `+2726FU,T12` inside
-//! a `Position` block):
+//! The grammar is the CSA standard kifu move format of the specification's own
+//! examples, v1.2.1 section 3: sign, from-square, to-square, and two uppercase
+//! letters naming the kind as it stands *after* the move. So a promotion is
+//! written by naming the promoted kind — `+2822UM`, a bishop arriving at 22 as
+//! a horse — and there is no separate promotion marker. A `<from>` of `00` is
+//! a drop from hand.
 //!
-//! ```text
-//! <move>   ::= <sign> <from> <to> <piece>
-//! <sign>   ::= "+" | "-"          Black or White, the mover
-//! <from>   ::= "00" | <square>    "00" is a drop from hand
-//! <to>     ::= <square>           never "00"
-//! <square> ::= <file 1-9> <rank 1-9>
-//! <piece>  ::= two uppercase letters, the kind as it stands AFTER the move
-//! ```
+//! Parsing and resolution are separate stages because their failures are
+//! classed differently: a line that does not parse is a malformed line, and a
+//! line that parses but denotes nothing is (bar
+//! [`ResolveError::NotSideToMove`]) an illegal move.
 //!
-//! Because `<piece>` names the kind *after* the move, a promotion is written by
-//! naming the promoted kind — `+2822UM`, a bishop arriving at 22 as a horse —
-//! and there is no separate promotion marker.
-//!
-//! **Two stages, because P-4 classes their failures differently.** A line that
-//! does not parse and a line that parses but denotes nothing in this position
-//! are different types here, so the session can implement P-4's table without
-//! looking at move text again:
-//!
-//! | Failure | P-4 class |
-//! |---|---|
-//! | [`ParseError`] | Malformed line: a protocol error, logged, ending no game |
-//! | [`ResolveError::NotSideToMove`] | Protocol error that changes no state |
-//! | Every other [`ResolveError`] | Legal syntax, illegal move: `#ILLEGAL_MOVE` |
-//! | [`RenderError`] | Neither — a server-side inconsistency, never a client's doing |
-//!
-//! This file is where a square is spelled `77` and a pawn is spelled `FU`, and
-//! it is the only such place: `game/` never sees either (invariant 3, which
-//! keeps every encoding out of the rules engine).
+//! This is the only place a square is spelled `77` and a pawn `FU`; `game/`
+//! never sees either.
 
 use std::fmt;
 
@@ -47,15 +27,10 @@ const MOVE_LEN: usize = 7;
 
 /// A move as written on the wire, parsed but not yet read against a position.
 ///
-/// The fields carry no invariant between them, so they are public on the same
-/// terms as `game::Piece`'s. In particular a drop of a King is representable —
-/// `+0055OU` is a well-formed CSA line denoting an impossible move, and it is
-/// [`WrittenMove::resolve`] that has something to say about it, not the
-/// grammar.
-///
-/// `from` is an [`Option`] rather than a [`Square`] that might hold `00`: a
-/// `Square` cannot express `00` at all, so the drop marker is decoded where it
-/// is read and never travels as a sentinel.
+/// The fields carry no invariant between them. A drop of a King is
+/// representable — `+0055OU` is a well-formed CSA line denoting an impossible
+/// move, and it is [`WrittenMove::resolve`] that has something to say about
+/// it, not the grammar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WrittenMove {
     /// The mover, from the leading `+` or `-`.
@@ -88,12 +63,12 @@ impl fmt::Display for Endpoint {
 
 /// Why a line is not a move at all.
 ///
-/// P-4's malformed-line class in full: every variant is a protocol error that
-/// ends no game. Nothing borrows the line, so a rejection outlives the codec's
-/// buffer and can be logged after the next read.
+/// Every variant is a protocol error that ends no game. Nothing borrows the
+/// line, so a rejection outlives the codec's buffer and can be logged after
+/// the next read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ParseError {
-    /// Fewer characters than a move has. `+77FU` is P-4's own example.
+    /// Fewer characters than a move has.
     #[error("a move is {} characters, got {got}", MOVE_LEN)]
     Length {
         /// How many characters arrived.
@@ -101,7 +76,7 @@ pub enum ParseError {
     },
 
     /// Text follows the move. A `,T` suffix is the likely cause: the server
-    /// appends that on relay, and the client sends the bare form (P-4).
+    /// appends that on relay, and the client sends the bare form.
     #[error(
         "text follows the {}-character move; the client sends it bare, with no ,T suffix",
         MOVE_LEN
@@ -128,8 +103,8 @@ pub enum ParseError {
     #[error("00 is a hand, not a destination")]
     DropDestination,
 
-    /// Two letters outside the fourteen. `+7776XX` is P-4's own example, and a
-    /// lowercase `+7776fu` lands here too — the letters are uppercase.
+    /// Two letters outside the fourteen. A lowercase `+7776fu` lands here too:
+    /// the letters are uppercase.
     #[error("{}{} is not one of the fourteen CSA piece names", got[0], got[1])]
     Piece {
         /// The two characters as they arrived.
@@ -139,14 +114,13 @@ pub enum ParseError {
 
 /// Why a well-formed move denotes nothing in this position.
 ///
-/// Every variant but [`ResolveError::NotSideToMove`] is P-4's legal-syntax,
-/// illegal-move class — the side of the table that ends the game. Which is
-/// which is the session's decision to make from this value; this layer only
-/// makes the cases distinguishable.
+/// Every variant but [`ResolveError::NotSideToMove`] ends the game as an
+/// illegal move. Which is which is the session's decision to make from this
+/// value; this layer only makes the cases distinguishable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ResolveError {
-    /// The sign names the side that is not to move. P-4 treats this as a
-    /// protocol error that changes no state.
+    /// The sign names the side that is not to move: a protocol error that
+    /// changes no state.
     #[error("a {written:?} move arrived with {side_to_move:?} to move")]
     NotSideToMove {
         /// The side the sign names.
@@ -155,8 +129,7 @@ pub enum ResolveError {
         side_to_move: Color,
     },
 
-    /// The from-square holds nothing. P-4's `+7775FU` with no pawn on 7g is
-    /// this variant.
+    /// The from-square holds nothing.
     #[error("no piece stands on {}{}", from.file(), from.rank())]
     EmptySquare {
         /// The square found empty.
@@ -176,8 +149,7 @@ pub enum ResolveError {
     },
 
     /// A drop of a King or of a promoted kind. Neither has a `Move::Drop` to
-    /// build: `game::HandKind` has no value for it, which is the same
-    /// guarantee that keeps a promoted piece out of a hand.
+    /// build: `game::HandKind` has no value for it.
     #[error("{kind:?} cannot be dropped from hand")]
     UndroppableKind {
         /// The kind the line wrote.
@@ -187,10 +159,10 @@ pub enum ResolveError {
 
 /// Why a move could not be written down.
 ///
-/// Neither of P-4's classes: both variants mean the position handed in does
-/// not match the move handed in, which is a stale snapshot on this server's
-/// side rather than anything a client sent. They are errors and not panics
-/// because a panic on the relay path would take a live game down with it.
+/// Both variants mean the position handed in does not match the move handed
+/// in, which is a stale snapshot on this server's side rather than anything a
+/// client sent. They are errors and not panics because a panic on the relay
+/// path would take a live game down with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RenderError {
     /// A board move whose from-square holds nothing, so there is no kind to
@@ -214,17 +186,15 @@ pub enum RenderError {
 impl WrittenMove {
     /// Parses one bare move, exactly as [`super::Command::Move`] carries it.
     ///
-    /// Syntax only: the result may denote nothing at all in any position, and
-    /// saying so is [`WrittenMove::resolve`]'s job.
+    /// Syntax only: the result may denote nothing at all in any position.
     pub fn parse(line: &str) -> Result<Self, ParseError> {
-        // Characters, not bytes, so that a full-width or otherwise multi-byte
-        // line is a length or coordinate error rather than a byte-count
-        // accident.
+        // Characters, not bytes, so that a multi-byte line is a length or
+        // coordinate error rather than a byte-count accident.
         let mut chars = line.chars();
 
         // The sign is read before the length is known, so a line with no sign
         // at all -- `7776FU` -- is reported as the missing sign rather than as
-        // a length that happens to be short by one.
+        // a length short by one.
         let Some(sign) = chars.next() else {
             return Err(ParseError::Length { got: 0 });
         };
@@ -270,8 +240,7 @@ impl WrittenMove {
     ///
     /// `position` is the position *before* the move, since that is where the
     /// moving piece still stands. The mover is an argument rather than
-    /// `position.side_to_move()` so that a caller rendering a setup sequence
-    /// says whose move it is writing at the call site.
+    /// `position.side_to_move()`, for a caller rendering a setup sequence.
     pub fn of(color: Color, mv: Move, position: &Position) -> Result<Self, RenderError> {
         match mv {
             Move::Drop { piece, to } => Ok(Self {
@@ -304,17 +273,13 @@ impl WrittenMove {
 
     /// The move this text denotes in `position`, or why it denotes none.
     ///
-    /// Not a legality check. Whether the piece can reach the destination,
-    /// whether it may promote there, whether the hand holds what is dropped —
-    /// all of that is `game::legality`'s, on the [`Move`] returned here. The
-    /// piece's *owner* is not checked either, for the same reason: an
-    /// opponent's piece still denotes the move, and `Illegal::NotOwnPiece`
-    /// already exists one layer up.
+    /// Not a legality check, and not an ownership check: an opponent's piece
+    /// still denotes the move. Both are `game::legality`'s, on the [`Move`]
+    /// returned here.
     pub fn resolve(&self, position: &Position) -> Result<Move, ResolveError> {
-        // The sign is settled before the board is read. P-4 makes a move by the
-        // side not to move a protocol error that changes no state, so it has to
-        // be reported as itself rather than as whatever the opponent's half of
-        // the position says about the same squares.
+        // The sign is settled before the board is read, so a move by the side
+        // not to move is reported as itself rather than as whatever the
+        // opponent's half of the position says about the same squares.
         if self.color != position.side_to_move() {
             return Err(ResolveError::NotSideToMove {
                 written: self.color,
@@ -352,9 +317,6 @@ impl WrittenMove {
     }
 }
 
-/// The one place the `00` and the digit order are spelled. The sign comes from
-/// `sign_of`, which a `Position` block's cells, hand lines, and turn line
-/// share.
 impl fmt::Display for WrittenMove {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let sign = sign_of(self.color);
@@ -372,11 +334,9 @@ impl fmt::Display for WrittenMove {
     }
 }
 
-/// The character CSA writes for `color`.
-///
-/// Shared with `super::position_block`, where the same two characters spell a
-/// board cell's owner, a `P+` / `P-` hand line, and the turn line. One mapping,
-/// so the sign a move carries and the sign a row carries cannot disagree.
+/// The character CSA writes for `color`, shared with
+/// `super::position_block`'s cells, hand lines and turn line so the two cannot
+/// disagree.
 pub(super) const fn sign_of(color: Color) -> char {
     match color {
         Color::Black => '+',
@@ -386,14 +346,9 @@ pub(super) const fn sign_of(color: Color) -> char {
 
 /// The two letters naming `kind`.
 ///
-/// Exhaustive rather than a lookup, so this direction is total by compiler
-/// check: a fifteenth kind would not compile. That [`kind_of`] agrees with it
-/// is a test's business.
-///
-/// Shared with `super::position_block`'s row renderer, so the crate holds
-/// exactly one mapping from a kind to its CSA letters and the two spellings
-/// cannot drift.
-pub(super) const fn letters_of(kind: PieceKind) -> [char; 2] {
+/// Public rather than `pub(super)` because the board the web half draws reads
+/// it too: the crate holds exactly one mapping from a kind to its CSA letters.
+pub const fn letters_of(kind: PieceKind) -> [char; 2] {
     match kind {
         PieceKind::Pawn => ['F', 'U'],
         PieceKind::Lance => ['K', 'Y'],
@@ -433,12 +388,8 @@ fn kind_of(letters: [char; 2]) -> Option<PieceKind> {
     })
 }
 
-/// A file digit and a rank digit as a square.
-///
-/// `Square::new` is the range check, so the 1–9 bound is not restated here: a
-/// zero digit fails there. `00` has already been taken as the from-square's
-/// hand marker before this is reached, and as a destination it is
-/// [`ParseError::DropDestination`].
+/// A file digit and a rank digit as a square. `Square::new` is the range
+/// check, so the 1–9 bound is not restated here.
 fn parse_square(endpoint: Endpoint, digits: [char; 2]) -> Result<Square, ParseError> {
     digit(digits[0])
         .zip(digit(digits[1]))
@@ -459,7 +410,6 @@ mod tests {
     use super::*;
     use crate::game::{Piece, Position};
 
-    /// Every kind, so a test can quantify over all fourteen.
     const ALL_KINDS: [PieceKind; 14] = [
         PieceKind::King,
         PieceKind::Rook,
@@ -478,7 +428,6 @@ mod tests {
     ];
 
     fn square(file: u8, rank: u8) -> Square {
-        // The tests' own coordinates, all literal and on the board.
         Square::new(file, rank).expect("test coordinate is on the board")
     }
 
@@ -523,8 +472,6 @@ mod tests {
 
     #[test]
     fn parses_a_promoted_kind_as_written() {
-        // The kind is the one that stands after the move, so a promotion has no
-        // marker of its own.
         assert_eq!(parse("+2822UM").kind, PieceKind::PromotedBishop);
     }
 
@@ -561,8 +508,6 @@ mod tests {
         }
     }
 
-    /// The render direction is exhaustive by compiler check; this is the other
-    /// half — that parsing admits those fourteen pairs and nothing else.
     #[test]
     fn exactly_fourteen_uppercase_pairs_name_a_piece() {
         let mut accepted = 0;
@@ -578,7 +523,6 @@ mod tests {
 
     #[test]
     fn rejects_a_line_of_the_wrong_length() {
-        // P-4's own malformed example, and the empty line.
         assert_eq!(
             WrittenMove::parse("+77FU"),
             Err(ParseError::Length { got: 5 })
@@ -589,7 +533,6 @@ mod tests {
 
     #[test]
     fn rejects_trailing_text_including_a_consumption_suffix() {
-        // The relay appends ",T12"; the client sends the bare move (P-4).
         assert_eq!(WrittenMove::parse("+7776FU,T12"), Err(ParseError::Trailing));
         assert_eq!(WrittenMove::parse("+7776FUX"), Err(ParseError::Trailing));
     }
@@ -622,7 +565,6 @@ mod tests {
 
     #[test]
     fn rejects_a_destination_of_double_zero() {
-        // A hand is where a piece comes from, never where it goes.
         assert_eq!(
             WrittenMove::parse("+7700FU"),
             Err(ParseError::DropDestination)
@@ -643,8 +585,7 @@ mod tests {
 
     #[test]
     fn a_multi_byte_line_is_a_syntax_error_rather_than_a_byte_count_accident() {
-        // Seven characters, nineteen bytes: counted as characters, this is a
-        // coordinate error and not a length one.
+        // Seven characters, nineteen bytes.
         assert_eq!(
             WrittenMove::parse("+７７７６ＦＵ"),
             Err(ParseError::Coordinate {
@@ -669,8 +610,6 @@ mod tests {
 
     #[test]
     fn resolves_a_written_promoted_kind_as_a_promotion() {
-        // Hirate's own bishops face each other down the diagonal, so 88x22
-        // promoting is a real move from the real starting position.
         let position = Position::hirate();
         assert_eq!(
             parse("+8822UM").resolve(&position),
@@ -715,9 +654,6 @@ mod tests {
         );
     }
 
-    /// Whether the hand actually holds the piece is `Illegal::NotInHand`'s
-    /// question, on the resolved move. Resolution answers only what the text
-    /// denotes.
     #[test]
     fn resolution_does_not_ask_whether_the_hand_holds_the_piece() {
         let position = Position::hirate();
@@ -733,7 +669,6 @@ mod tests {
 
     #[test]
     fn an_empty_from_square_is_a_resolution_error() {
-        // P-4's `+7775FU` with no pawn on 7g.
         let mut position = Position::hirate();
         position.set_piece_at(square(7, 7), None);
         assert_eq!(
@@ -784,9 +719,6 @@ mod tests {
         );
     }
 
-    /// The sign is settled before the board is read, so the side-not-to-move
-    /// case — a protocol error that changes no state — is never masked by the
-    /// board's opinion of the same squares.
     #[test]
     fn the_sign_is_reported_ahead_of_anything_the_board_would_say() {
         let mut position = Position::hirate();
@@ -800,8 +732,6 @@ mod tests {
         );
     }
 
-    /// Resolution reads the board, it does not judge it. An opponent's piece
-    /// still denotes the move; `Illegal::NotOwnPiece` is one layer up.
     #[test]
     fn resolution_does_not_judge_ownership() {
         let position = Position::hirate();
@@ -815,8 +745,6 @@ mod tests {
         );
     }
 
-    /// Every accepted example renders back to the exact line it was parsed
-    /// from, so both directions are pinned by one assertion each.
     #[test]
     fn every_resolved_move_renders_back_to_its_own_line() {
         let mut position = Position::hirate();
@@ -868,7 +796,6 @@ mod tests {
 
     #[test]
     fn rendering_from_an_empty_square_is_an_error_rather_than_a_panic() {
-        // A caller holding a stale position: the pawn has already moved.
         let mut position = Position::hirate();
         position.set_piece_at(square(7, 7), None);
 
@@ -943,8 +870,6 @@ mod tests {
         );
     }
 
-    /// The move a client sends arrives through [`super::super::Command::Move`],
-    /// which carries the line raw. This is the seam the two slices meet at.
     #[test]
     fn the_command_layers_raw_move_line_parses_here() {
         let command = crate::csa::Command::parse("+7776FU").expect("a move line");

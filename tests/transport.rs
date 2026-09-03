@@ -1,30 +1,25 @@
-//! P-8 over real sockets: the same game played over plaintext and over TLS, and
-//! the two socket options read back off the connection the server accepted.
+//! The transport over real sockets: the same game played over plaintext and
+//! over TLS, and the two socket options read back off the connection the server
+//! accepted.
 //!
-//! P-8 has no specification text behind it, so its completion criteria carry
-//! the whole burden:
+//! No specification text governs the transport, so these two claims carry the
+//! whole burden:
 //!
-//! > - A game completes over TLS and over plaintext, by configuration alone.
-//! > - Both socket options are set on every game connection, asserted in an
-//! >   integration test that inspects the socket.
+//! - A game completes over TLS and over plaintext, by configuration alone.
+//! - Both socket options are set on every game connection, read back off the
+//!   socket the server accepted.
 //!
-//! **"By configuration alone" is asserted as one function run twice.** Both
-//! games below are played by [`resign_and_watch`], which knows nothing about the
+//! "By configuration alone" is asserted as one function run twice: both games
+//! below are played by [`resign_and_watch`], which knows nothing about the
 //! transport it is speaking over, from configuration texts that differ by the
-//! `[server.tls]` table and nothing else. A difference between the two would
-//! therefore have to appear as a difference in what the CSA protocol does, which
-//! is exactly what P-8 promises there is none of.
+//! `[csa.tls]` table and nothing else.
 //!
-//! **The inspection is of the server's own socket, not the client's.** The
-//! server runs in this process, so the connection it accepted is one of this
-//! process's file descriptors; `read_options` finds it by the one thing that
-//! identifies it — its peer is the client's own address — and reads the two
-//! options back with `getsockopt`. Nothing in `src/` exists to make this
-//! possible. That whole half of this file is Linux-only, because `TCP_QUICKACK`
-//! is a Linux socket option and the descriptor it is read from is found by
-//! walking `/proc/self/fd`; on other platforms the `inspection` module below is
-//! not compiled, and the tests that play games over the two transports are all
-//! that runs.
+//! The inspection is of the server's own socket, not the client's. The server
+//! runs in this process, so the connection it accepted is one of this process's
+//! file descriptors; `read_options` finds it by its peer being the client's own
+//! address, and reads the two options back with `getsockopt`. That half of this
+//! file is Linux-only, because `TCP_QUICKACK` is a Linux socket option and the
+//! descriptor is found by walking `/proc/self/fd`.
 
 mod common;
 
@@ -38,11 +33,9 @@ use tabia_shogi_server::{Startup, run};
 
 use common::{Game, HIRATE, PATIENCE, TestTls, Wire, config_text, one_game_over, start};
 
-/// The usual test configuration, with `[server.tls]` appended.
+/// The usual test configuration, with `[csa.tls]` appended.
 ///
-/// The plaintext text and this one differ by that table alone, which is what
-/// makes the pair of games below a test of the configuration rather than of two
-/// servers.
+/// The plaintext text and this one differ by that table alone.
 fn tls_config_text(tls: &TestTls) -> String {
     format!("{}{}", config_text(4, 1), tls.table())
 }
@@ -60,7 +53,8 @@ async fn resign_and_watch(mut game: Game) {
     game.black.expect("-3334FU,T1").await;
     game.white.expect("-3334FU,T1").await;
 
-    // P-7's three lines, in the specification's order, with opposite results.
+    // The three termination lines, in the specification's order, with opposite
+    // results.
     game.black.send("%TORYO").await;
     for client in [&mut game.black, &mut game.white] {
         client.expect("%TORYO,T1").await;
@@ -70,6 +64,7 @@ async fn resign_and_watch(mut game: Game) {
     game.white.expect("#WIN").await;
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_game_completes_over_plaintext() {
     let server = start(&config_text(4, 1), HIRATE).await;
@@ -77,6 +72,7 @@ async fn a_game_completes_over_plaintext() {
     resign_and_watch(one_game_over(&server, &Wire::Plain).await).await;
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_game_completes_over_tls_by_configuration_alone() {
     let tls = TestTls::generate("game-over-tls");
@@ -85,13 +81,13 @@ async fn a_game_completes_over_tls_by_configuration_alone() {
     resign_and_watch(one_game_over(&server, &tls.wire()).await).await;
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_relay_reaches_a_client_that_writes_nothing_after_its_own_move() {
-    // A7: "A move written by the server is on the wire without waiting for
-    // another write or an acknowledgement." Each client reads the relay of the
-    // other's move having sent nothing since its own, so a write that waited for
-    // a second write would hang until the patience ran out — over TLS as much as
-    // over plaintext, since a TLS writer holds a record until it is flushed.
+    // Each client reads the relay of the other's move having sent nothing since
+    // its own, so a write that waited for a second write would hang until the
+    // patience ran out — over TLS as much as over plaintext, since a TLS writer
+    // holds a record until it is flushed.
     let tls = TestTls::generate("flush-per-line");
     let plaintext = start(&config_text(4, 1), HIRATE).await;
     let encrypted = start(&tls_config_text(&tls), HIRATE).await;
@@ -114,11 +110,11 @@ async fn a_relay_reaches_a_client_that_writes_nothing_after_its_own_move() {
     }
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_plaintext_client_gets_nowhere_against_a_tls_listener() {
-    // The switch is real rather than decorative. A client that does not speak
-    // TLS is dropped at the handshake, and what comes back is a TLS alert rather
-    // than any CSA line: nothing has been negotiated that could carry one.
+    // A client that does not speak TLS is dropped at the handshake, and what
+    // comes back is a TLS alert rather than any CSA line.
     let tls = TestTls::generate("plaintext-against-tls");
     let server = start(&tls_config_text(&tls), HIRATE).await;
 
@@ -140,20 +136,21 @@ async fn a_plaintext_client_gets_nowhere_against_a_tls_listener() {
     assert!(!text.contains("LOGIN:"), "a CSA answer arrived: {text:?}");
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_certificate_that_is_not_there_fails_at_startup_naming_the_file() {
-    // O-1: an invalid configuration fails at startup naming the problem. The
-    // transport is built before the listener is bound, so this is a failure an
-    // operator sees at once rather than on the first engine that connects.
+    // The transport is built before the listener is bound, so this is a failure
+    // an operator sees at once rather than on the first engine that connects.
     let cert = "/nonexistent/tabia/cert.pem";
     let text = format!(
-        "{}\n[server.tls]\ncert = \"{cert}\"\nkey = \"/nonexistent/tabia/key.pem\"\n",
+        "{}\n[csa.tls]\ncert = \"{cert}\"\nkey = \"/nonexistent/tabia/key.pem\"\n",
         config_text(4, 1)
     );
     let startup = Startup::new(
         Config::parse(&text).expect("the configuration is well formed"),
         Collection::parse(HIRATE).expect("one hirate entry"),
     )
+    .await
     .expect("nothing about the entries forbids it");
 
     let error = match run(startup).await {
@@ -164,14 +161,11 @@ async fn a_certificate_that_is_not_there_fails_at_startup_naming_the_file() {
     assert!(error.contains(cert), "{error}");
 }
 
-/// P-8's second criterion: the two options read back off the connection the
-/// server accepted.
+/// The two socket options, read back off the connection the server accepted.
 ///
-/// Linux-only, and gated as a whole rather than per line, because everything in
-/// here is: `TCP_QUICKACK` is a Linux socket option that no other platform
-/// exposes, and the accepted socket is found by walking `/proc/self/fd`, which
-/// no other platform has. `set_quickack` in `src/` draws the same line, and
-/// Linux is where the server runs.
+/// Linux-only: `TCP_QUICKACK` is a Linux socket option that no other platform
+/// exposes, and the accepted socket is found by walking `/proc/self/fd`.
+/// `set_quickack` in `src/` draws the same line.
 #[cfg(target_os = "linux")]
 mod inspection {
     use std::net::SocketAddr;
@@ -182,21 +176,20 @@ mod inspection {
     use tokio::net::TcpStream;
     use tokio::time::{Instant, sleep};
 
-    use tabia_shogi_server::session::Server;
+    use tabia_shogi_server::Running;
 
     use super::common::{
         Client, HIRATE, PATIENCE, TestTls, Wire, config_text, seated_over, start, start_game,
     };
     use super::tls_config_text;
 
-    /// Reads P-8's two options back off the connection the server accepted from
-    /// `peer`, retrying until the accept has happened.
+    /// Reads the two socket options back off the connection the server accepted
+    /// from `peer`, retrying until the accept has happened.
     ///
-    /// `TCP_QUICKACK` is deliberately read before the connection has carried any
-    /// game traffic: Linux clears it again on its own once a connection looks
-    /// like the interactive exchange a game is, so what it pins is the state an
-    /// accepted connection starts in. `TCP_NODELAY` is sticky, and is asserted
-    /// mid-game too.
+    /// `TCP_QUICKACK` is read before the connection has carried any game
+    /// traffic, because Linux clears it again on its own once a connection looks
+    /// like the interactive exchange a game is. `TCP_NODELAY` is sticky, and is
+    /// asserted mid-game too.
     async fn accepted_socket_options(peer: SocketAddr) -> (bool, bool) {
         let deadline = Instant::now() + PATIENCE;
 
@@ -252,12 +245,11 @@ mod inspection {
         None
     }
 
-    /// Connects, inspects the socket the server accepted, and then goes on to
-    /// log in over the transport — so that what was inspected is a connection
-    /// that really does become a game connection, and not a bare socket nobody
-    /// plays on.
+    /// Connects, inspects the socket the server accepted, and then logs in over
+    /// the transport, so that what was inspected is a connection that becomes a
+    /// game connection.
     async fn options_of_a_connection_that_then_logs_in(
-        server: &Server,
+        server: &Running,
         wire: &Wire,
     ) -> (bool, bool, bool) {
         let tcp = TcpStream::connect(server.local_addr())
@@ -276,6 +268,7 @@ mod inspection {
         (nodelay, quickack, still_nodelay)
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn both_socket_options_are_set_on_an_accepted_plaintext_connection() {
         let server = start(&config_text(4, 1), HIRATE).await;
@@ -294,12 +287,11 @@ mod inspection {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn both_socket_options_are_set_on_an_accepted_tls_connection() {
         // The options are set at accept, before the handshake, so a TLS
-        // connection carries them for its ClientHello as much as for its moves —
-        // which is also why `TCP_QUICKACK` is read before the handshake and
-        // `TCP_NODELAY`, the sticky one, after it as well.
+        // connection carries them for its ClientHello as much as for its moves.
         let tls = TestTls::generate("options-over-tls");
         let server = start(&tls_config_text(&tls), HIRATE).await;
 
@@ -317,11 +309,11 @@ mod inspection {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn nodelay_is_still_set_on_both_connections_of_a_running_game() {
-        // `TCP_NODELAY` is the sticky one of the two, and it is the one A7's "on
-        // the wire without waiting for another write" depends on for the whole
-        // game.
+        // `TCP_NODELAY` is the sticky one of the two, and the one a relay
+        // reaching the wire without a second write depends on.
         let server = start(&config_text(4, 1), HIRATE).await;
         let seats = seated_over(&server, ["engine-a", "engine-b"], &Wire::Plain).await;
         let peers: Vec<SocketAddr> = seats

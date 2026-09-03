@@ -1,16 +1,13 @@
 //! When a matchmaking round runs.
 //!
-//! Matchmaking is **time-driven** (C-1, the matchmaking schedule, decided
-//! 2026-08-17): a login, a discarded pairing, and a game ending each put a
-//! session in the pool, and the pool waits for a round the server's own schedule
-//! fixes. Every other integration test asserts what a round *produces*, under
-//! the one-second interval `common::PROMPT_SCHEDULE` configures; this file
-//! asserts the three settings that decide *when* — over a real socket, through
-//! the same schedule a deployed server runs, with no test-only path around it.
+//! Matchmaking is time-driven: a login, a discarded pairing and a game ending
+//! each put a session in the pool, and the pool waits for a round the server's
+//! own schedule fixes. Every other integration test asserts what a round
+//! produces; this file asserts the three settings that decide when.
 //!
-//! Each test therefore states its own `[matchmaking]` table, and the assertion
-//! is the arrival — or the absence — of a `Game_Summary` two engines could not
-//! have asked for.
+//! Each test states its own `[matchmaking]` table, and the assertion is the
+//! arrival — or the absence — of a `Game_Summary` two engines could not have
+//! asked for.
 
 mod common;
 
@@ -19,9 +16,8 @@ use std::time::Duration;
 use common::{Client, PROMPT_SCHEDULE, config_text_with_schedule, seated, start, start_game};
 
 /// A timestamp far enough out that no round is due within any test run, and one
-/// long past. Fixed strings rather than a formatted `now ± something`: what is
-/// under test is a configured wall-clock time, and a test that computes one
-/// would be asserting against its own arithmetic.
+/// long past. Fixed strings rather than a formatted `now ± something`, so
+/// nothing is asserted against the test's own arithmetic.
 const FAR_FUTURE: &str = "2099-01-01T00:00:00Z";
 const LONG_PAST: &str = "2000-01-01T00:00:00Z";
 
@@ -30,22 +26,22 @@ const LONG_PAST: &str = "2000-01-01T00:00:00Z";
 /// then waits for.
 const ENOUGH_FOR_A_ROUND: Duration = Duration::from_millis(2_500);
 
-/// The interval of the amended rule's case below, in seconds.
+/// The interval of the idle-delay case below, in seconds.
 ///
-/// Longer than `common::PATIENCE`, deliberately: a re-pairing seen inside the
-/// patience then cannot be the interval round, so the assertion separates the
-/// idle delay from "the next interval came round anyway".
+/// Longer than `common::PATIENCE`, so a re-pairing seen inside the patience
+/// cannot be the interval round.
 const SLOW_INTERVAL_SECONDS: u64 = 8;
 
 /// Long enough that the interval round after the one that paired — one that
 /// runs while the game is going and finds nobody to pair — has certainly run.
 const PAST_THE_INTERVAL_ROUND: Duration = Duration::from_millis(8_500);
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_first_round_at_in_the_future_holds_the_pool_until_it_arrives() {
-    // A full pool, a one-second interval, and a first round in 2099: rule 1
-    // governs the first round alone, and until it runs there is no round for
-    // rule 2 to measure an interval from.
+    // A full pool, a one-second interval, and a first round in 2099:
+    // `first_round_at` governs the first round alone, and until it runs there
+    // is no round for the interval to measure from.
     let server = start(
         &config_text_with_schedule(&format!(
             "[matchmaking]\n\
@@ -66,6 +62,7 @@ async fn a_first_round_at_in_the_future_holds_the_pool_until_it_arrives() {
     other.expect_nothing_for(Duration::from_millis(200)).await;
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_first_round_at_already_past_falls_back_to_the_idle_delay() {
     // Two seconds after startup, and an interval an hour long: the pairing
@@ -87,18 +84,19 @@ async fn a_first_round_at_already_past_falls_back_to_the_idle_delay() {
     let mut other = Client::connect(server.local_addr()).await;
     other.login("engine-b", "token-b").await;
 
-    // Not on the second login, which is what used to pair them.
+    // Not on the second login: a login starts no round.
     one.expect_nothing_for(Duration::from_millis(500)).await;
 
     let summary = one.summary().await;
     assert_eq!(other.summary().await.game_id(), summary.game_id());
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn the_round_after_a_game_ends_comes_from_the_idle_delay() {
     // One second of idle delay against an hour of interval, so a re-pairing
-    // inside the patience is rule 2's `min` taking the idle-delay side: the
-    // interval from the round that started the game is an hour away.
+    // inside the patience is the `min` of the two taking the idle-delay side:
+    // the interval from the round that started the game is an hour away.
     let server = start(
         &config_text_with_schedule(
             "[matchmaking]\n\
@@ -120,22 +118,20 @@ async fn the_round_after_a_game_ends_comes_from_the_idle_delay() {
     game.black.expect("#LOSE").await;
     game.white.expect("#WIN").await;
 
-    // The server now has no game in progress, which is the moment the idle
-    // delay is measured from — and it is measured from the *server* being
-    // empty, not from either session's own report.
+    // The idle delay is measured from the server being empty, not from either
+    // session's own report.
     let next = game.black.summary().await;
     assert_ne!(next.game_id(), game.id);
     assert_eq!(game.white.summary().await.game_id(), next.game_id());
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_game_ending_after_a_round_that_paired_nobody_still_comes_from_the_idle_delay() {
-    // The case rule 2's amendment (2026-08-18) is written for. The first round
-    // pairs a and b; at the interval mark the next round runs while their game
-    // is still going and pairs nobody, since nothing else is in the pool; the
-    // game then ends. The idle delay is measured from that transition — the
-    // server going from a game in progress to none — and not from what the
-    // most recent round happened to do.
+    // The first round pairs a and b; at the interval mark the next round runs
+    // while their game is still going and pairs nobody; the game then ends. The
+    // idle delay is measured from that transition rather than from what the most
+    // recent round did.
     let server = start(
         &config_text_with_schedule(&format!(
             "[matchmaking]\n\
@@ -172,6 +168,7 @@ async fn a_game_ending_after_a_round_that_paired_nobody_still_comes_from_the_idl
     assert_eq!(game.white.summary().await.game_id(), next.game_id());
 }
 
+#[cfg_attr(miri, ignore)]
 #[tokio::test]
 async fn a_round_during_a_running_game_pairs_the_pool_and_leaves_the_game_alone() {
     let server = start(&config_text_with_schedule(PROMPT_SCHEDULE), common::HIRATE).await;

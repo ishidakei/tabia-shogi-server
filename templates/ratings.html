@@ -1,0 +1,84 @@
+{% extends "layout.html" %}
+
+{% block title %}
+{%- if table.window().is_long_term() %}レーティング (通算){% else %}レーティング (直近2週間){% endif %} — tabia-shogi-server
+{%- endblock %}
+
+{% block content %}
+{% if table.window().is_long_term() %}
+<h2>レーティング (通算)</h2>
+<p class="muted">
+レーティングの対象となったすべての対局から算定した表です。
+<a href="{{ table.other().path() }}">直近2週間の表</a>もあります。
+</p>
+{% else %}
+<h2>レーティング (直近2週間)</h2>
+<p class="muted">
+直近2週間に終局した対局だけから算定した表です。
+<a href="{{ table.other().path() }}">通算の表</a>もあります。
+</p>
+{% endif %}
+
+<p class="muted">
+レーティングはエンジンごとに算定します (トークンが異なれば別エンジンとして扱います)。
+重み付けの成績で1勝以上・1敗以上・15局以上を満たしたエンジンだけを対象とします。
+プリセットエンジンも、ほかのエンジンとまったく同じ条件で並びます。
+</p>
+
+{% if table.is_on_designated_ratings() %}
+<p class="muted">
+運営は、いくつかのエンジンに指定レートを与えています。
+これは、そのエンジンの強さの目安として運営が定めた値です。
+表の数値は、指定レートに合うように全体を上下させたものです。
+上下のさせ方は、直接または間接に対戦した相手をたどってつながるまとまりごとに、そのまとまりの中の指定レートから決めます。
+指定レート自体は算定には入れないので、指定レートを与えられたエンジンも、
+そのエンジンのレートとして表示されるのは、算定した値です。
+</p>
+<p class="muted">
+表に載るのは、指定レートを与えられていて上の条件を満たしたエンジンと、
+直接または間接に対戦した相手をたどってそこにつながるエンジンです。
+指定レートを持つエンジンと、直接または間接に対戦した相手をたどってつながらないエンジンは、この表には出ません。
+</p>
+{% else if let Some(baseline) = table.baseline() %}
+<p class="muted">
+指定レート (エンジンの強さの目安として運営が定めた値) を持つエンジンが、
+まだ上の条件を満たしていません。
+そこで、対戦相手の種類がもっとも多いエンジンと、直接または間接に対戦した相手をたどってそこにつながるエンジンを載せ、
+その平均が {{ baseline }} になるようそろえています。
+</p>
+{% endif %}
+
+{% if let Some(published_at) = table.published_at() %}
+<p class="muted">最終算定 (UTC): {{ published_at }}</p>
+{% else %}
+<p class="muted">まだ一度も算定していません。</p>
+{% endif %}
+
+{% if table.is_empty() %}
+<p class="muted">レーティングの付いた参加者はまだいません。</p>
+{% else %}
+<table>
+<thead>
+<tr><th>順位</th><th>エンジン名</th><th>レーティング</th><th>対局数</th><th>GitHub</th></tr>
+</thead>
+<tbody>
+{% for participant in table.participants() %}
+<tr>
+<td>{{ participant.rank() }}</td>
+<td><a href="/participants/{{ participant.token_key() }}">{{ participant.display_name() }}</a></td>
+<td>{{ participant.rating() }}</td>
+<td>{{ participant.games() }}</td>
+<td>
+{%- if let Some(identity) = participant.identity() -%}{{ identity.account_name() }}
+{%- else -%}<span class="muted">—</span>
+{%- endif -%}
+</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+<p class="muted">
+GitHub の欄に出るのは、その参加者の持ち主が GitHub のアカウントを第三者に公開すると選んだ場合のアカウント名だけです。
+</p>
+{% endif %}
+{% endblock %}

@@ -2,47 +2,31 @@
 //! game to a termination, how each of them settles against a clock, and what a
 //! finished game sends.
 //!
-//! This module owns the per-game state — the `Game` itself, and the snapshots
-//! published from it. The *task* is the half that reads commands,
-//! measures what elapsed between them, and writes lines; it arrives with the
-//! runtime wiring, and takes [`Game::apply`]'s `charged` from
-//! [`clock::charged_units`]. What is here is the state it will own, on the same
-//! terms as the four session pieces before it: no tokio, no socket, and nothing
-//! that asks what time it is.
+//! The task is the half that reads commands, measures what elapsed between
+//! them and writes lines; it lives in [`pairing`](super::pairing). What is
+//! here is the state that task owns: no tokio, no socket, and nothing that
+//! asks what time it is.
 //!
-//! **The flag is decided here, not in the task.** A `Game` is already the single
-//! ordering authority for P-4 — a move from the side not to move is refused
-//! here — and P-5's timeout is a game rule rather than a transport fact. A task
-//! that decided it as well would be a second authority on when a move counts,
-//! and the two could disagree on the same input. What the task still owns is
-//! *measurement*: what elapsed, and the deadline that makes a player who sends
-//! nothing at all flag. [`Game::allowance`] is the number it arms that deadline
-//! with, and [`Game::expired`] is where the measurement it wakes with is
-//! judged — by the same predicate an arrival is judged by, so the two paths
-//! cannot part company.
+//! The flag is decided here rather than in the task, because a `Game` is
+//! already the single ordering authority for move relay and a task that
+//! decided the timeout as well could disagree with it on the same input. What
+//! the task owns is measurement: [`Game::allowance`] is the number it arms a
+//! deadline with, and [`Game::expired`] judges what it wakes with, by the same
+//! predicate an arrival is judged by.
 //!
-//! **`csa` joins the layer here.** `game/` depends on nothing (invariant 1), so
-//! a `game::Outcome` cannot name the `#RESIGN` it maps to; `csa` decides no
-//! rules, so it takes a termination's reason and result as inputs. The layer
-//! that may see both is this one, and [`termination_of`] is P-7's table written
-//! once in it — the same reasoning [`session`](super) records for the two
-//! `TimeUnit` mirrors.
+//! `csa` joins the layer here: `game/` depends on nothing, so a
+//! `game::Outcome` cannot name the `#RESIGN` it maps to, and [`termination_of`]
+//! is that table written once.
 //!
-//! **Invariant 5 is why [`Game::new`] seeds the history rather than the task.**
-//! Setup moves are game history: they belong in `moves`, and repetition (P-6)
-//! and `Max_Moves` (P-2) count them. A game whose
-//! first entry is the first *real* move is a game those two slices would
-//! silently get wrong, so there is no moment at which a `Game` exists without
-//! them.
+//! Setup moves are game history, which is why [`Game::new`] seeds the history
+//! rather than the task: both repetition and `Max_Moves` count them, so there
+//! is no moment at which a `Game` exists without them.
 //!
-//! **Invariant 2 is why nothing here asks what the position is.** A start is a
-//! [`StartSpec`] decoded once; hirate is one value of it, reached by a replay
-//! that ran zero times, and no branch distinguishes that case.
-//!
-//! [`clock::charged_units`]: super::clock::charged_units
+//! Nothing here asks what the position is. A start is a [`StartSpec`] decoded
+//! once, hirate is one value of it, and no branch distinguishes that case.
 
 use crate::config::TimeConfig;
-use crate::csa::{GameResult, Reason};
+use crate::csa::{Closing, Ending, GameResult, Reason};
 use crate::game::{
     Color, Illegal, IllegalSetup, Move, Outcome, Position, RepetitionState, StartSpec, apply_move,
 };
@@ -52,33 +36,23 @@ use super::clock::{effective_setup, increment_units, setup_t_values, total_units
 
 /// One entry of a game's history — a setup move or a played one.
 ///
-/// **A typed [`Move`], where the design writes `csa: String`.** A deliberate
-/// divergence: invariant 3 keeps CSA spellings at
-/// the codec, and this layer reads parsed types only. That string is
-/// the *record's* projection of this entry, rendered at C-7's edge from the move
-/// and the position it was played in — which is also where the notation the
-/// codec relayed is already available. Storing it here would put a second
-/// spelling of one move in the layer least able to check the two agree.
-///
-/// Every field is a fact about the entry rather than an invariant between them,
-/// so they are public, on [`csa::MoveEcho`]'s terms.
-///
-/// [`csa::MoveEcho`]: crate::csa::MoveEcho
+/// A typed [`Move`] rather than the CSA text of one: a CSA spelling stays at
+/// the codec, and the record's text is rendered at record generation's edge
+/// from the move and the position it was played in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PlayedMove {
-    /// Which ply this is: **1-based across the whole history**, setup included,
-    /// so that the *n*th entry of a game is the *n*th move of the record and of
-    /// the `Max_Moves` count alike. Part 3 numbers nothing; this is the
-    /// numbering that makes invariant 5 readable.
+    /// Which ply this is: 1-based across the whole history, setup included, so
+    /// that the *n*th entry of a game is the *n*th move of the record and of
+    /// the `Max_Moves` count alike.
     pub ply: u32,
 
     /// The move itself.
     pub mv: Move,
 
-    /// The value written on the wire, which equals the value deducted
-    /// (invariant 4). For a setup move this is [`setup_t_values`]'s entry — the
-    /// increment, or increment plus reduction on the reduced side's first move
-    /// — and for a played move the charge the task measured.
+    /// The value written on the wire, which equals the value deducted. For a
+    /// setup move this is [`setup_t_values`]'s entry — the increment, or
+    /// increment plus reduction on the reduced side's first move — and for a
+    /// played move the charge the task measured.
     pub t: u32,
 
     /// Whether this entry came from the setup sequence rather than from a
@@ -88,12 +62,8 @@ pub struct PlayedMove {
 
 /// The state of one game.
 ///
-/// Part 3's `Game`, restricted to the fields the milestones so far have reached:
-/// the identifier, the start as it was actually transmitted, the position play
-/// began from and the position now, the history, the time settings, the two
-/// clocks, and the outcome once there is one. Players, engine names, the two
-/// category tags, and the timestamps arrive with the milestones that read them
-/// (C-5, C-7).
+/// Restricted to what play itself needs. Players, engine names, the two
+/// category tags and the timestamps belong to the features that read them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Game {
     id: String,
@@ -101,25 +71,19 @@ pub struct Game {
     initial: Position,
     position: Position,
     moves: Vec<PlayedMove>,
-    /// The settings both clocks were seeded from, kept because settlement needs
-    /// the increment and the flag needs the byoyomi on **every** event, for the
-    /// life of the game. `TimeConfig` is `Copy + Eq`, so this costs one field
-    /// and keeps both numbers derived from the one value the game was created
-    /// with; a pair of pre-converted counts beside it would be the same fact
-    /// written twice.
+    /// The settings both clocks were seeded from, kept because settlement
+    /// needs the increment and the flag needs the byoyomi on every event, for
+    /// the life of the game.
     time: TimeConfig,
     remaining: [u32; 2],
-    /// Every position this game has held, counted (P-6). Seeded from the
-    /// **transmitted** start's traversal in [`Game::new`], so a game never
-    /// exists without it — the same reasoning invariant 5 gives for `moves`,
-    /// and for the same failure: a repetition counted from the first real move
-    /// is one the clients would be told about too late, or not at all.
+    /// Every position this game has held, counted for repetition. Seeded from
+    /// the transmitted start's traversal in [`Game::new`], because a
+    /// repetition counted from the first real move is one the clients would be
+    /// told about too late, or not at all.
     repetition: RepetitionState,
-    /// `Max_Moves`: the absolute ply limit, **setup entries included** (P-2,
-    /// PRD A2). `None` is the specification's "no restriction if omitted", and
-    /// it is the only spelling of absence here — shogi-server's `@max_moves > 0`
-    /// guard is how Ruby says the same thing, and a zero sentinel beside the
-    /// `Option` would be one absence written twice.
+    /// `Max_Moves`: the absolute ply limit, setup entries included. `None` is
+    /// the specification's "no restriction if omitted", and the only spelling
+    /// of absence here.
     max_moves: Option<u32>,
     outcome: Option<Outcome>,
 }
@@ -127,46 +91,32 @@ pub struct Game {
 impl Game {
     /// A game about to start, from the pairing's start and time settings.
     ///
-    /// **The substitution is applied once, here.** [`effective_setup`] decides
-    /// whether the sequence transmitted is the authored one or the king shuttle,
-    /// and what this stores is the result of that decision. The summary the task
-    /// encodes, the history below, and the T-values all read the one stored
-    /// value, so they cannot disagree about how many moves are on the wire.
+    /// The substitution is applied once, here: [`effective_setup`] decides
+    /// whether the sequence transmitted is the authored one or the king
+    /// shuttle, and the summary the task encodes, the history below and the
+    /// T-values all read the one stored value.
     ///
-    /// The stored start is then decoded — one path, whatever the entry was — and
-    /// its setup moves become the first entries of the history, each carrying
-    /// its [`setup_t_values`] entry. Both clocks start at the configured
-    /// allowance and then **settle** each of those values, exactly as a played
-    /// move settles: the value is written, so it is deducted (invariant 4), and
-    /// the turn's increment is credited against it.
+    /// The stored start is then decoded and its setup moves become the first
+    /// entries of the history, each carrying its [`setup_t_values`] entry.
+    /// Both clocks start at the configured allowance and then settle each of
+    /// those values, exactly as a played move settles.
     ///
-    /// **The repetition count begins here too**, at the transmitted start rather
-    /// than at the first real move (P-6). The start's own position is one
-    /// occurrence, and every position the setup sequence passes through is
-    /// recorded exactly as a live move records — one traversal, so what the
-    /// history holds and what the count saw cannot disagree. A dummy buoy
-    /// therefore holds **two** occurrences of hirate before the first real move,
-    /// which is a consequence of the rule and not a case anything branches on
-    /// (invariant 2).
+    /// The repetition count begins here too, at the transmitted start rather
+    /// than at the first real move, so a dummy buoy holds two occurrences of
+    /// hirate before the first real move.
     ///
-    /// The two cancel, which is the whole point of the convention. A symmetric
-    /// setup under an increment therefore reaches `START` with both clocks at
-    /// the full allowance (P-2's worked example), and the `T602` form leaves the
-    /// reduced side at `total − reduction` with its opponent full — the numbers
-    /// a client following `remaining + increment − T` computes for itself.
+    /// The written value and the increment cancel, so a symmetric setup under
+    /// an increment reaches `START` with both clocks at the full allowance and
+    /// the `T602` form leaves the reduced side at `total − reduction`.
     ///
-    /// **`max_moves` is taken, not computed** (P-2). It is the whole game's ply
-    /// ceiling, the setup entries included, so the seeding below already spends
-    /// part of it — which is exactly PRD A2's "a game whose opening sequence is
-    /// *n* plies has `Max_Moves − n` plies left to play", with no arithmetic
-    /// anywhere to get wrong. `None` is "no restriction if omitted".
+    /// `max_moves` is taken, not computed: it is the whole game's ply ceiling,
+    /// setup entries included, so the seeding below already spends part of it.
     ///
     /// # Errors
     ///
     /// [`IllegalSetup`] if the transmitted sequence is not legal from hirate.
-    /// O-1 rejects such an entry at load time, so reaching this at runtime means
-    /// an entry got past the loader — but the game is refused rather than
-    /// started from a position no replay produced.
+    /// Startup validation rejects such an entry at load time, so reaching this
+    /// at runtime means an entry got past the loader.
     pub fn new(
         id: String,
         spec: &StartSpec,
@@ -188,12 +138,11 @@ impl Game {
         let mut repetition = RepetitionState::new();
         repetition.count_start(transmitted);
         for position in traversed {
-            // The verdict is deliberately dropped. A setup sequence that repeats
-            // a position four times is an entry O-1 refuses at load, and ending
-            // a game that has not started — before `START`, with no client owed
-            // a termination — would be an invented behavior rather than a
-            // missing one. What matters here is that the positions are
-            // *counted*.
+            // The verdict is dropped: a setup sequence that repeats a position
+            // four times is an entry startup validation refuses, and ending a
+            // game before `START`, with no client owed a termination, would be
+            // an invented behaviour. What matters here is that the positions
+            // are counted.
             let _ = repetition.record(position);
         }
 
@@ -261,7 +210,8 @@ impl Game {
         self.position.side_to_move()
     }
 
-    /// The history, setup moves included (invariant 5).
+    /// The history, setup moves included — they are game history like any
+    /// other entry.
     pub fn moves(&self) -> &[PlayedMove] {
         &self.moves
     }
@@ -269,10 +219,8 @@ impl Game {
     /// What `side` has left, as a count of `Time_Unit`s.
     ///
     /// Units rather than a [`Duration`](std::time::Duration): every value ever
-    /// added to or taken from a clock is a written T-value, and those are unit
-    /// counts. Converting once in [`clock`](super::clock) and never again is
-    /// that module's contract, and holding the remainder in units is what keeps
-    /// it to one conversion.
+    /// added to or taken from a clock is a written T-value, and holding the
+    /// remainder in units is what keeps the crate to one conversion.
     pub const fn remaining(&self, side: Color) -> u32 {
         self.remaining[slot(side)]
     }
@@ -297,61 +245,52 @@ impl Game {
 
     /// Applies a move from `side`, charged `charged` units.
     ///
-    /// P-4's rules, in the order it states them, with P-5's flag inserted where
-    /// shogi-server puts it (`Game#handle_one_move`: the wrong side first, then
-    /// the timeout, then the arrived input). A legal move is appended to the
+    /// The move-relay rules, in the order they are stated, with the flag
+    /// inserted where shogi-server puts it (`Game#handle_one_move`: the wrong
+    /// side first, then the timeout, then the arrived input). A legal move is
+    /// appended to the
     /// history with the next ply, the mover's clock settles the charge, and the
     /// caller relays `<move>,T<charged>` — the value written is the value
-    /// deducted (invariant 4), which is why one number is both.
+    /// deducted, which is why one number is both.
     ///
     /// Validation is [`game::apply_move`] against the position, whatever that
-    /// position is: correctness from a buoy start is the same code path as from
-    /// hirate, with no branch that could be right in one case and wrong in the
-    /// other.
+    /// position is.
     ///
-    /// **A legal move can end the game** (P-6). The position it produced is
-    /// recorded, and the fourth occurrence of a key ends the game where it
-    /// stands: [`Outcome::Repetition`] for a plain repetition, and
-    /// [`Outcome::PerpetualCheck`] against whichever side the streak rule names
-    /// as the checker — which is *not* always the mover, since the side escaping
-    /// a perpetual check is the one whose move closes the cycle. The move itself
-    /// stays applied, recorded, settled, and returned: the game ended **with**
-    /// it, not instead of it, which is also what lets P-7 echo it with the
-    /// consumption time it was actually charged. A caller relays the move as it
-    /// always did and then asks [`outcome`](Self::outcome).
+    /// A legal move can end the game: the fourth occurrence of a key ends it
+    /// where it stands, as [`Outcome::Repetition`] or as
+    /// [`Outcome::PerpetualCheck`] against whichever side the streak rule
+    /// names as the checker — which is not always the mover, since the side
+    /// escaping a perpetual check is the one whose move closes the cycle. The
+    /// move itself stays applied, recorded, settled and returned, so the
+    /// termination can echo it with the consumption time it was charged.
     ///
-    /// **`Max_Moves` is decided last, and only where nothing else decided**
-    /// (P-2). shogi-server checks it after both repetition rules
+    /// `Max_Moves` is decided last, and only where nothing else decided.
+    /// shogi-server checks it after both repetition rules
     /// (`board.rb#handle_one_move`: oute_kaihimore → uchifuzume →
     /// oute_sennichite → sennichite → max_moves), so a move that both reaches
     /// the limit and completes a fourth occurrence ends `#SENNICHITE` or
-    /// `#OUTE_SENNICHITE` rather than `#MAX_MOVES`. The predicate is
+    /// `#OUTE_SENNICHITE`. The predicate is
     /// [`reached_max_moves`](Self::reached_max_moves) over the whole history,
-    /// setup entries included (invariant 5) — which is the entirety of what
-    /// makes PRD A2's "the limit applies to the whole transmitted game" true.
+    /// setup entries included.
     ///
     /// # Errors
     ///
     /// - [`Rejected::Finished`] — the game already ended. A caller bug; nothing
     ///   changes.
-    /// - [`Rejected::NotToMove`] — a move from the side not to move. P-4 makes
-    ///   this a protocol error rather than an illegal move, so **no state
-    ///   changes at all**: not the position, not the history, and not the
-    ///   clocks — in particular the sender is not charged for a move the game
-    ///   never saw. This stays ahead of the flag, as it is in the reference: the
-    ///   player whose clock is *not* running cannot cause it to fall, however
-    ///   far over the allowance the other side is.
+    /// - [`Rejected::NotToMove`] — a move from the side not to move. The
+    ///   specification makes this a protocol error rather than an illegal
+    ///   move, so no state changes at all and the sender is not charged for a
+    ///   move the game never saw. This stays ahead of the flag, as in the
+    ///   reference: the player whose clock is not running cannot cause it to
+    ///   fall.
     /// - [`Rejected::Timeout`] — the charge reached the side to move's
-    ///   allowance, so the flag fell before this move existed:
-    ///   [`Outcome::Timeout`] against `side`. The move is **not recorded** and
-    ///   **nothing is settled** — the reference never reaches `process_time` on
-    ///   this path, and a clock movement no client was told of is invariant 4
-    ///   broken. The unrecorded move is the same rule an illegal one follows,
-    ///   for the same reason: it was never played on the board.
-    /// - [`Rejected::Illegal`] — the move is illegal, and the game is over:
-    ///   [`Outcome::IllegalMove`] against `side`, whom the termination scores
-    ///   `#LOSE`. The charge is still deducted, because the termination echoes
-    ///   the received move with it (P-7) and a written value is a deducted one.
+    ///   allowance, so the flag fell before this move existed. The move is not
+    ///   recorded and nothing is settled: the reference never reaches
+    ///   `process_time` on this path, and a clock movement no client was told
+    ///   of is a deduction with no written value beside it.
+    /// - [`Rejected::Illegal`] — the move is illegal, and the game is over.
+    ///   The charge is still deducted, because the termination echoes the
+    ///   received move with it.
     ///
     /// [`game::apply_move`]: crate::game::apply_move
     pub fn apply(&mut self, side: Color, mv: Move, charged: u32) -> Result<PlayedMove, Rejected> {
@@ -386,8 +325,7 @@ impl Game {
                 self.moves.push(played);
 
                 // `repetition::Verdict`, spelled out: this module's own
-                // `Verdict` is what a *finished* game sends, and the two would
-                // read alike at a glance.
+                // `Verdict` is what a finished game sends.
                 self.outcome = match self.repetition.record(&self.position) {
                     repetition::Verdict::None => None,
                     repetition::Verdict::Draw => Some(Outcome::Repetition),
@@ -413,29 +351,18 @@ impl Game {
     /// Records `%TORYO` from `side`, charged `charged` units.
     ///
     /// The game ends [`Outcome::Resignation`] against `side`, and the returned
-    /// [`Verdict`] is what the task sends with it: the specification's own
-    /// sequence, `%TORYO,T<charged>` then `#RESIGN` then the result. The echoed
-    /// text is the client's line, relayed verbatim by the codec — invariant 3
-    /// keeps that spelling out of here.
+    /// [`Verdict`] is the specification's own sequence: `%TORYO,T<charged>`,
+    /// `#RESIGN`, the result. The charge settles, because it is written.
     ///
-    /// The charge settles for the same reason [`apply`](Self::apply) settles one
-    /// on an illegal move: it is written, so it is deducted.
+    /// A late `%TORYO` is a flag, not a resignation: the reference decides the
+    /// timeout before it reads what arrived (`Game#handle_one_move`), so if
+    /// `side` is the side to move and `charged` reached its allowance the
+    /// outcome is [`Outcome::Timeout`] against it and nothing is settled.
     ///
-    /// **A late `%TORYO` is a flag, not a resignation.** The reference decides
-    /// the timeout before it reads what arrived (`Game#handle_one_move`), and a
-    /// declaration is not exempt: if `side` is the side to move and `charged`
-    /// reached its allowance, the outcome is [`Outcome::Timeout`] against it,
-    /// nothing is settled, and the returned [`Verdict`] describes *that*
-    /// termination. A caller renders what it is handed and is right either way;
-    /// one that names the outcome itself must read
-    /// [`outcome`](Self::outcome) instead.
-    ///
-    /// **No turn check otherwise.** P-4's protocol error is about a *move*
-    /// arriving from the side not to move; nothing pins whether a client may
-    /// resign while its opponent is thinking, and refusing it here would be
-    /// inventing a rule that costs a resigning engine its termination. Nor can
-    /// such a resignation flag: that side's clock is not running, so no
-    /// allowance applies to it.
+    /// No turn check otherwise. The protocol error is about a move arriving
+    /// from the side not to move, and nothing pins whether a client may resign
+    /// while its opponent is thinking. Nor can such a resignation flag: that
+    /// side's clock is not running.
     ///
     /// # Errors
     ///
@@ -457,43 +384,59 @@ impl Game {
         Ok(termination_of(outcome))
     }
 
+    /// Records the server's abort of this game.
+    ///
+    /// The game ends [`Outcome::Aborted`] with no winner and no draw, and the
+    /// returned [`Verdict`] is `#CHUDAN` then `#CENSORED` to both sides, with
+    /// nothing before them.
+    ///
+    /// No side, no clock and no charge: nobody sent anything, so there is
+    /// nothing to echo and nothing to deduct. Nor is the deadline consulted, a
+    /// flag falling in the same instant would score the game against a preset
+    /// for a decision the server made.
+    ///
+    /// The one caller is the matchmaker freeing a slot from a preset-vs-preset
+    /// game.
+    ///
+    /// # Errors
+    ///
+    /// [`Finished`] if the game already ended; nothing changes. That is the
+    /// race the abort is expected to lose sometimes.
+    pub fn abort(&mut self) -> Result<Verdict, Finished> {
+        if let Some(outcome) = self.outcome {
+            return Err(Finished { outcome });
+        }
+
+        self.outcome = Some(Outcome::Aborted);
+
+        Ok(termination_of(Outcome::Aborted))
+    }
+
     /// Records `%KACHI` from `side`, charged `charged` units.
     ///
-    /// The declaration is adjudicated against **this game's position**, whatever
-    /// start produced it, by [`declaration::holds`] — the four conditions of the
-    /// `Declaration:Jishogi 1.1` rule announced in `Game_Summary`. A declaration
-    /// that holds ends the game [`Outcome::Declaration`] with `valid: true`, a
-    /// win for `side`; one that does not ends it with `valid: false`, which is an
-    /// illegal action by the declarer and a loss for it. Both are terminations:
-    /// the reference makes the failed declaration itself the losing act rather
-    /// than an ignored line, so there is no path here that leaves the game
-    /// running.
+    /// The declaration is adjudicated against this game's position by
+    /// [`declaration::holds`], under the `Declaration:Jishogi 1.1` rule
+    /// announced in `Game_Summary`. One that holds is a win for `side`; one
+    /// that does not is an illegal action by the declarer and a loss. Both are
+    /// terminations, so there is no path here that leaves the game running.
     ///
-    /// **Nothing is recorded and nothing is settled.** No move was played, so the
-    /// ply count does not advance and `Max_Moves` is not approached by declaring;
-    /// and the echo carries no `,T` (the reference writes a bare `%KACHI`), so
-    /// deducting a charge would move a clock no client was ever told about —
-    /// invariant 4 in the direction a resignation reads it forwards. A
-    /// resignation's T-value is written, so it is deducted; a declaration's is
-    /// not written, so it is not deducted.
+    /// Nothing is recorded and nothing is settled: no move was played, and the
+    /// echo carries no `,T` (the reference writes a bare `%KACHI`), so
+    /// deducting a charge would move a clock no client was told about.
     ///
-    /// **A late `%KACHI` is a flag, not a declaration**, on exactly
-    /// [`resign`](Self::resign)'s terms: the reference decides the timeout before
-    /// it reads what arrived, so a declaration charged past the allowance is
-    /// [`Outcome::Timeout`] against the declarer and is never adjudicated.
+    /// A late `%KACHI` is a flag, not a declaration, on
+    /// [`resign`](Self::resign)'s terms.
     ///
     /// # Errors
     ///
     /// - [`NotDeclarable::Finished`] — the game already ended; nothing changes.
-    /// - [`NotDeclarable::NotToMove`] — a declaration from the side not to move.
-    ///   The reference reaches `good_kachi?` only from the current player, and
-    ///   the 27-point rule is a claim about the position on one's **own** turn,
-    ///   so there is nothing here to adjudicate. Answered as P-4 answers a move
-    ///   from the wrong side — a protocol error that alters no state — rather
-    ///   than as a failed declaration, which would end the game against a player
-    ///   whose claim was never judged. This is where a declaration and a
-    ///   resignation differ: giving up is available at any time, and claiming a
-    ///   win is not.
+    /// - [`NotDeclarable::NotToMove`] — a declaration from the side not to
+    ///   move. The reference reaches `good_kachi?` only from the current
+    ///   player, so there is nothing here to adjudicate; answering it as a
+    ///   failed declaration would end the game against a player whose claim
+    ///   was never judged. This is where a declaration and a resignation
+    ///   differ: giving up is available at any time, and claiming a win is
+    ///   not.
     pub fn declare(&mut self, side: Color, charged: u32) -> Result<Verdict, NotDeclarable> {
         if let Some(outcome) = self.outcome {
             return Err(Finished { outcome }.into());
@@ -518,36 +461,25 @@ impl Game {
 
     /// Records `%CHUDAN` from `side`, charged `charged` units.
     ///
-    /// **Suspension is not supported**, and that is a route rather than a
-    /// silence: the reference reaches it through its own code. `command.rb`
-    /// classes `%CHUDAN` as an ordinary special move (`/^%[^%]/` →
-    /// `SpecialCommand`), `board.rb`'s `handle_one_move` matches it against
+    /// Suspension is not supported, and that is a route rather than a silence:
+    /// `command.rb` classes `%CHUDAN` as an ordinary special move (`/^%[^%]/`
+    /// → `SpecialCommand`), `board.rb`'s `handle_one_move` matches it against
     /// `%KACHI` and `%TORYO`, falls through to `:illegal`, and `game.rb` ends
     /// the game against the sender (`GameResultIllegalMoveWin`). So an in-game
-    /// `%CHUDAN` is an illegal move by whoever sent it and loses:
-    /// [`Outcome::IllegalMove`] against `side`, which carries P-7's row for an
-    /// illegal move unchanged — the same reason line, the same two results, and
-    /// the same timed echo of the line received. Nothing here is new.
+    /// `%CHUDAN` is [`Outcome::IllegalMove`] against `side`.
     ///
-    /// The charge settles for [`apply`](Self::apply)'s reason: the echo writes
-    /// it, so it is deducted (invariant 4). Nothing is recorded — no move was
-    /// played, so the ply count does not advance and `Max_Moves` is not
-    /// approached by asking for a suspension.
+    /// The charge settles, because the echo writes it. Nothing is recorded: no
+    /// move was played, so `Max_Moves` is not approached by asking for a
+    /// suspension.
     ///
-    /// **A late `%CHUDAN` is a flag**, exactly as a late `%TORYO` or a late
-    /// `%KACHI` is: the reference checks the timeout before it adjudicates
-    /// anything, so the outcome is [`Outcome::Timeout`] against `side` and
-    /// nothing is settled.
+    /// A late `%CHUDAN` is a flag, exactly as a late `%TORYO` is.
     ///
     /// # Errors
     ///
-    /// - [`NotSuspendable::Finished`] — the game already ended; nothing changes.
-    /// - [`NotSuspendable::NotToMove`] — a `%CHUDAN` from the side not to move.
-    ///   Answered as P-4 answers a move from the wrong side — a protocol error
-    ///   that alters no state — on [`declare`](Self::declare)'s terms: the
-    ///   reference reads a special move only from the current player, so there
-    ///   is nothing to adjudicate, and ending the game against a player whose
-    ///   line was never adjudicated is precisely what that path avoids.
+    /// - [`NotSuspendable::Finished`] — the game already ended; nothing
+    ///   changes.
+    /// - [`NotSuspendable::NotToMove`] — a `%CHUDAN` from the side not to
+    ///   move, on [`declare`](Self::declare)'s terms.
     pub fn suspend(&mut self, side: Color, charged: u32) -> Result<Verdict, NotSuspendable> {
         if let Some(outcome) = self.outcome {
             return Err(Finished { outcome }.into());
@@ -573,26 +505,18 @@ impl Game {
     /// The armed deadline fired with `charged` units elapsed and nothing
     /// received.
     ///
-    /// P-5's other timeout path, and the only one that reaches a **silent**
-    /// player: the arrival path above cannot fire, because a client that stops
-    /// sending never produces an arrival to measure. What the task supplies is
-    /// the measurement — [`clock::charged_units`] of what has elapsed since the
-    /// previous relay — and the verdict is the same `flagged` predicate a move
-    /// goes through, so a timer and an arrival cannot reach different answers
-    /// on the same numbers.
+    /// The only timeout path that reaches a silent player: the arrival path
+    /// cannot fire, because a client that stops sending produces no arrival to
+    /// measure. The verdict is the same `flagged` predicate a move goes
+    /// through, so a timer and an arrival cannot reach different answers on
+    /// the same numbers.
     ///
-    /// `None` where the game already ended, or where the charge does **not**
-    /// reach the side to move's allowance. The second is a turn still open, not
-    /// an error: a caller rearms its deadline rather than terminating, and the
-    /// verdict rather than the timer decides. [`clock::flag_after`] makes it
-    /// unreachable for a timer that fires no earlier than the instant it was
-    /// armed for.
+    /// `None` where the game already ended, or where the charge does not reach
+    /// the side to move's allowance. The second is a turn still open: a caller
+    /// rearms its deadline rather than terminating.
     ///
-    /// Nothing is settled and no move is recorded — there is nothing to record,
-    /// and a clock movement no client was told of is invariant 4 broken.
-    ///
-    /// [`clock::charged_units`]: super::clock::charged_units
-    /// [`clock::flag_after`]: super::clock::flag_after
+    /// Nothing is settled and no move is recorded: a clock movement no client
+    /// was told of is a deduction with no written value beside it.
     pub fn expired(&mut self, charged: u32) -> Option<Verdict> {
         if self.outcome.is_some() {
             return None;
@@ -610,9 +534,8 @@ impl Game {
     /// The allowance `side` just exceeded, or `None` if it did not — or could
     /// not, because it is not the side whose clock is running.
     ///
-    /// One predicate for both events, so that a move and a `%TORYO` cannot reach
-    /// different verdicts on the same numbers. Returning the allowance rather
-    /// than a `bool` because every caller reports it.
+    /// One predicate for both events, so that a move and a `%TORYO` cannot
+    /// reach different verdicts on the same numbers.
     fn flagged(&self, side: Color, charged: u32) -> Option<u32> {
         if side != self.side_to_move() {
             return None;
@@ -626,13 +549,12 @@ impl Game {
     ///
     /// `>=` rather than `==`, as in the reference
     /// (`@max_moves > 0 && @move_count >= @max_moves`): the two differ only
-    /// where a `Game` was hand-built over a setup that already meets the limit,
-    /// and there the game ends on the first real move rather than never. O-1
-    /// keeps a configured collection away from that case, and the reading is the
-    /// one `config/validate.rs`'s own table gives it — "otherwise the game ends
-    /// `#MAX_MOVES` at move one".
+    /// where a `Game` was hand-built over a setup that already meets the
+    /// limit, and there the game ends on the first real move rather than
+    /// never.
     ///
-    /// `None` never reaches it: no limit is no restriction, not a limit of zero.
+    /// `None` never reaches it: no limit is no restriction, not a limit of
+    /// zero.
     fn reached_max_moves(&self) -> bool {
         self.max_moves
             .is_some_and(|max| self.moves.len() >= usize::try_from(max).unwrap_or(usize::MAX))
@@ -648,15 +570,14 @@ impl Game {
     /// if (player.mytime < 0) then player.mytime = 0 end
     /// ```
     ///
-    /// The credit is what makes invariant 4 hold across a whole game and not
-    /// merely across one move: a client applies `remaining + increment − T` to
+    /// The credit is what makes the written value equal the deducted one
+    /// across a whole game: a client applies `remaining + increment − T` to
     /// what it was told, and this is the same arithmetic on the same numbers.
     ///
-    /// The floor diverges from an unclamped client ledger in exactly one case —
-    /// a configured reduction larger than `Total_Time`, which is a configuration
-    /// with no sensible reading — and the clamp settles it rather than O-1
-    /// gaining a rule for it. Saturating rather than wrapping for the reason it
-    /// always was: a wrapped clock reads as a side with four billion units left.
+    /// The floor diverges from an unclamped client ledger in exactly one case,
+    /// a configured reduction larger than `Total_Time`. Saturating rather than
+    /// wrapping, because a wrapped clock reads as a side with four billion
+    /// units left.
     fn settle(&mut self, side: Color, charged: u32) {
         let increment = increment_units(&self.time);
         let clock = &mut self.remaining[slot(side)];
@@ -666,20 +587,18 @@ impl Game {
 
 /// One settlement, as arithmetic alone: `clamp₀(remaining + increment − charged)`.
 ///
-/// A free function because [`Game::new`] settles its seeded setup moves before a
-/// `Game` exists to call a method on, and the seeding and the live path settling
-/// differently is precisely how the clocks would drift from the clients'.
+/// A free function because [`Game::new`] settles its seeded setup moves before
+/// a `Game` exists to call a method on.
 const fn settled(remaining: u32, increment: u32, charged: u32) -> u32 {
     remaining.saturating_add(increment).saturating_sub(charged)
 }
 
 /// What a finished game sends, derived from its [`Outcome`].
 ///
-/// P-7's table as one value: the reason line, the scoring the two result lines
-/// are read from, and whether a move or declaration was received to echo before
-/// them. The fields are private because the three are one mapping's output —
-/// a hand-built value could pair `#SENNICHITE` with a loser, and P-7 asks for
-/// one termination path precisely so that cannot happen.
+/// The reason line, the scoring the two result lines are read from, and
+/// whether a move or declaration was received to echo before them. The fields
+/// are private because a hand-built value could pair `#SENNICHITE` with a
+/// loser.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Verdict {
     reason: Reason,
@@ -701,59 +620,93 @@ impl Verdict {
     /// What precedes the reason line, if anything: the received line with its
     /// consumption time, the received line bare, or nothing at all.
     ///
-    /// The choice belongs here rather than at the call site that renders it, for
-    /// P-7's reason: one termination path, so the shape cannot come out right in
-    /// one case and wrong in another.
+    /// The choice belongs here rather than at the call site that renders it,
+    /// so the shape cannot come out right in one case and wrong in another.
     pub const fn echoing(self) -> Echoing {
         self.echo
     }
 
-    /// Whether a move or declaration was received **and accepted**, and so
-    /// precedes the reason line as an echo of either shape.
+    /// Whether a line precedes the reason line, of any of the three shapes.
     ///
-    /// False for exactly `#CENSORED` and `#TIME_UP`. The first means no move or
-    /// declaration was received at all.
-    /// `#TIME_UP` is the second for a reason of its own — one may well
-    /// have been received, and neither of its two paths *accepted* it. The
-    /// deadline path has nothing in hand to echo, and the arrival path
-    /// deliberately drops what it holds, because the flag fell before that line
-    /// existed: no clock moved, so an echo would announce a deduction that
-    /// never happened (invariant 4). It is shogi-server's own shape too
+    /// False for exactly `#TIME_UP`. A move may well have been received, and
+    /// neither of the two timeout paths accepted it: the flag fell before that
+    /// line existed, so no clock moved and an echo would announce a deduction
+    /// that never happened. It is shogi-server's own shape too
     /// (`game_result.rb`, `GameResultTimeoutWin#process`: `"#TIME_UP\n#WIN\n"`,
     /// with nothing before it).
     ///
-    /// The echo itself is built by the task, from the line the client sent.
+    /// The echo itself is built by the task, from the line the client sent —
+    /// except for [`Echoing::Fabricated`], which carries its own text because
+    /// no line was received to build one from.
     pub const fn is_echoed(self) -> bool {
         !matches!(self.echo, Echoing::None)
     }
 
-    /// The result line `side` receives.
+    /// The result line `side` receives, or `None` for a game with no result.
     ///
-    /// Total, because every outcome is scored: the two sides receive opposite
-    /// results where the game has a loser and the same one where it is drawn.
-    /// A termination a caller has to handle the *absence* of a result for no
-    /// longer exists — `#CHUDAN` was the one such case, and it went with the
-    /// decision that this server does not suspend games (see
-    /// [`Game::suspend`]).
-    pub fn result(self, side: Color) -> GameResult {
-        match self.scoring {
+    /// `None` is [`Scoring::Nobody`], the server's own abort. What those
+    /// clients read instead is [`closing`](Self::closing)'s `#CENSORED`, so
+    /// this `None` never leaves a client without a terminal line.
+    pub fn result(self, side: Color) -> Option<GameResult> {
+        Some(match self.scoring {
             Scoring::Loser(loser) if side == loser => GameResult::Lose,
             Scoring::Loser(_) => GameResult::Win,
             Scoring::Draw => GameResult::Draw,
+            Scoring::Nobody => return None,
+        })
+    }
+
+    /// Both sides' results, `[black, white]`, or `None` for a game with no
+    /// result — the shape a record is written from.
+    pub fn results(self) -> Option<[GameResult; 2]> {
+        Some([
+            self.result(Color::Black)?,
+            self.result(Color::White)
+                .unwrap_or_else(|| unreachable!("both sides read the one scoring")),
+        ])
+    }
+
+    /// The last line `side` reads: its result, or `#CENSORED`.
+    ///
+    /// Two terminations close with `#CENSORED` rather than a result. For the
+    /// server's own abort there is nothing else to write, an aborted game
+    /// having no result ([`Scoring::Nobody`]); for `#MAX_MOVES` v1.2.1 section
+    /// 3.4 fixes both lines — 「サーバは `#MAX_MOVES` `#CENSORED` と、規定手数へ
+    /// の到達を示す 1 行目の情報と、対局が打ち切られたことを表す 2 行目の情報の
+    /// 計 2 行を双方に送る」 — and shogi-server sends exactly that
+    /// (`game_result.rb`, `GameResultMaxMovesDraw#process`).
+    ///
+    /// Read from the reason rather than carried beside it, because a status
+    /// and a closing that could be set independently could be set to disagree.
+    /// [`result`](Self::result) is untouched: a `#MAX_MOVES` game is scored
+    /// [`Scoring::Draw`] everywhere off the wire.
+    pub fn closing(self, side: Color) -> Closing {
+        match self.reason {
+            Reason::MaxMoves => Closing::Censored,
+            // Spelled out rather than left to a wildcard, so a status added
+            // later is a decision about this line too.
+            Reason::Sennichite
+            | Reason::OuteSennichite
+            | Reason::IllegalMove
+            | Reason::TimeUp
+            | Reason::Resign
+            | Reason::Jishogi
+            | Reason::Censored
+            | Reason::Chudan
+            | Reason::IllegalAction => self.result(side).map_or(Closing::Censored, Closing::Result),
         }
     }
 }
 
 /// What a termination writes before its reason line.
 ///
-/// Three cases rather than a `bool` beside a time, because a `%KACHI` is echoed
-/// **bare**: shogi-server's `game_result.rb` writes `"%KACHI\n#JISHOGI\n#WIN\n"`
-/// and its three companions with no `,T` anywhere in them, unlike every other
-/// echoed termination. Nothing is deducted for a declaration either, so the wire
-/// and the clock agree (invariant 4).
+/// More than a `bool` beside a time, because a `%KACHI` is echoed bare:
+/// shogi-server's `game_result.rb` writes `"%KACHI\n#JISHOGI\n#WIN\n"` and its
+/// three companions with no `,T` anywhere in them. Nothing is deducted for a
+/// declaration either, so nothing written and nothing deducted agree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Echoing {
-    /// Nothing precedes the reason line — `#CENSORED` and `#TIME_UP`.
+    /// Nothing precedes the reason line — `#TIME_UP` alone.
     None,
 
     /// The received line with the time it was charged, `<line>,T<charged>`.
@@ -761,13 +714,22 @@ pub enum Echoing {
 
     /// The received line alone. `%KACHI` only.
     Bare,
+
+    /// A line the server writes for itself, echoed bare: a disconnect's
+    /// `%TORYO`, and nothing else.
+    ///
+    /// Distinct from [`Bare`](Self::Bare) because that one is the line the
+    /// client sent, and here no line was received at all, so the text travels
+    /// in the verdict. Bare because shogi-server writes
+    /// `"%TORYO\n#RESIGN\n#WIN\n"` with no consumption time, and nothing is
+    /// deducted.
+    Fabricated(&'static str),
 }
 
 /// How a finished game is scored.
 ///
-/// Two cases rather than a result per side, so that "the two clients receive
-/// opposite results" is a property of the type instead of a pair a caller has
-/// to keep consistent.
+/// A case per outcome shape rather than a result per side, so that the two
+/// clients receiving opposite results is a property of the type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scoring {
     /// The named side lost; the other won.
@@ -775,30 +737,47 @@ pub enum Scoring {
 
     /// Both sides drew — `#SENNICHITE` and `#MAX_MOVES`.
     Draw,
+
+    /// Nobody won and it is not a draw either: the server's own abort, and
+    /// nothing else.
+    ///
+    /// Distinct from [`Draw`](Self::Draw) because a draw is evidence — half a
+    /// win to each side, which the rating fit reads — and an aborted game is
+    /// none.
+    Nobody,
 }
 
-/// P-7's mapping from an outcome to what the game sends, in one place.
+/// The mapping from an outcome to what the game sends, in one place.
 ///
-/// Every variant maps to exactly one reason, and the result line is derived per
-/// side from the [`Scoring`] rather than chosen at the two call sites. Two
-/// entries are worth reading twice:
+/// Every variant maps to exactly one reason, and the result line is derived
+/// per side from the [`Scoring`] rather than chosen at the two call sites.
+/// Four entries are worth reading twice:
 ///
 /// - [`Outcome::Declaration`] splits on validity. A `%KACHI` that holds is
 ///   `#JISHOGI` and a win for the declarer; one that does not is an illegal
-///   action by the declarer, ends the game against them, and says `#ILLEGAL_MOVE`
-///   — the same status an illegal move gets, per the `Declaration` rule
-///   announced in `Game_Summary`. Both echo [`Echoing::Bare`]: the declaration
-///   is the one termination the reference writes with no `,T`.
-/// - [`Outcome::MaxMoves`] is a **draw**, following shogi-server's
-///   `GameResultMaxMovesDraw`. The specification lists the status without fixing
-///   the result, so the reference implementation governs (P-7).
-/// - [`Outcome::Timeout`] echoes **nothing**, unlike every other variant that
-///   can have a line in hand. See [`Verdict::is_echoed`] for why the two
-///   timeout paths agree on that.
-///
-/// There is no `#CHUDAN` row, because there is no outcome that reaches one: an
-/// in-game `%CHUDAN` is adjudicated an illegal move and takes
-/// [`Outcome::IllegalMove`]'s row unchanged ([`Game::suspend`]).
+///   action by the declarer and says `#ILLEGAL_MOVE`. Both echo
+///   [`Echoing::Bare`].
+/// - [`Outcome::MaxMoves`] is a draw, following shogi-server's
+///   `GameResultMaxMovesDraw`, since the specification lists the status
+///   without fixing the result. It is also the one outcome whose last line is
+///   not a result at all, which [`Verdict::closing`] reads from the reason.
+/// - [`Outcome::Timeout`] echoes nothing; see [`Verdict::is_echoed`].
+/// - [`Outcome::Disconnected`] is terminated as a resignation by the side that
+///   went away, following shogi-server (`game_result.rb`,
+///   `GameResultAbnormalWin#process`). The specification names
+///   [`Reason::Censored`] only as the line after `#MAX_MOVES` and says nothing
+///   about a dropped connection, so the reference governs.
+///   The `%TORYO` is the server's own ([`Echoing::Fabricated`]): nothing was
+///   The `%TORYO` is the server's own ([`Echoing::Fabricated`]), and nothing is
+///   deducted for it. The outcome stays distinct from a resignation everywhere
+///   but the wire: the record says `abnormal`, and the row and the log say
+///   `DISCONNECT`.
+/// - [`Outcome::Aborted`] is the `#CHUDAN` row, and it is the server's rather
+///   than any client's. It echoes nothing, is scored [`Scoring::Nobody`], and
+///   its last line is `#CENSORED` by [`Verdict::closing`]. The specification
+///   lists `#CHUDAN` (v1.2.1 section 3) without fixing what follows it, and
+///   `#CENSORED` — 「対局が打ち切られたことを表す」, section 3.4 — is the line
+///   that says what did happen.
 pub const fn termination_of(outcome: Outcome) -> Verdict {
     let (reason, scoring, echo) = match outcome {
         Outcome::Resignation { by } => (Reason::Resign, Scoring::Loser(by), Echoing::Timed),
@@ -817,13 +796,48 @@ pub const fn termination_of(outcome: Outcome) -> Verdict {
             (Reason::OuteSennichite, Scoring::Loser(by), Echoing::Timed)
         }
         Outcome::MaxMoves => (Reason::MaxMoves, Scoring::Draw, Echoing::Timed),
-        Outcome::Disconnected { by } => (Reason::Censored, Scoring::Loser(by), Echoing::None),
+        Outcome::Disconnected { by } => (
+            Reason::Resign,
+            Scoring::Loser(by),
+            Echoing::Fabricated("%TORYO"),
+        ),
+        Outcome::Aborted => (Reason::Chudan, Scoring::Nobody, Echoing::None),
     };
 
     Verdict {
         reason,
         scoring,
         echo,
+    }
+}
+
+/// The mapping from an outcome to the word its record ends with.
+///
+/// The vocabulary is shogi-server's (`game_result.rb`), and the mapping is
+/// total, so a record never needs a fall-back spelling invented for it.
+///
+/// Two rows are where the record and the wire part company:
+///
+/// - A `%KACHI` that does not hold says `#ILLEGAL_MOVE` on the wire and
+///   `illegal kachi` here: the wire tells a client what to do, and a record
+///   tells a reader what happened.
+/// - An in-game `%CHUDAN` is adjudicated an illegal move by its sender
+///   ([`Game::suspend`]) and takes [`Outcome::IllegalMove`]'s row unchanged.
+pub const fn record_ending(outcome: Outcome) -> Ending {
+    match outcome {
+        Outcome::Resignation { by: _ } => Ending::Toryo,
+        Outcome::Declaration { by: _, valid: true } => Ending::Kachi,
+        Outcome::Declaration {
+            by: _,
+            valid: false,
+        } => Ending::IllegalKachi,
+        Outcome::IllegalMove { by: _ } => Ending::IllegalMove,
+        Outcome::Timeout { by: _ } => Ending::TimeUp,
+        Outcome::Repetition => Ending::Sennichite,
+        Outcome::PerpetualCheck { by: _ } => Ending::OuteSennichite,
+        Outcome::MaxMoves => Ending::MaxMoves,
+        Outcome::Disconnected { by: _ } => Ending::Abnormal,
+        Outcome::Aborted => Ending::Chudan,
     }
 }
 
@@ -838,20 +852,18 @@ pub struct Finished {
 
 /// Why a `%KACHI` was not adjudicated.
 ///
-/// Neither variant is a *failed* declaration: a declaration that is judged and
-/// does not hold ends the game against the declarer and comes back as an
-/// [`Outcome::Declaration`], not as an error. These two are the cases where
-/// there was nothing to judge, which is why they may not collapse into it — one
-/// of them would otherwise end a game against a player whose claim was never
-/// read.
+/// Neither variant is a failed declaration: one that is judged and does not
+/// hold comes back as an [`Outcome::Declaration`]. These two are the cases
+/// where there was nothing to judge, and collapsing them into it would end a
+/// game against a player whose claim was never read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum NotDeclarable {
     /// The game had already ended. Nothing changed.
     #[error(transparent)]
     Finished(#[from] Finished),
 
-    /// A declaration from the side not to move: answered as P-4 answers a move
-    /// from the wrong side, altering no state. See [`Game::declare`].
+    /// A declaration from the side not to move: answered the way a move from
+    /// the wrong side is answered, altering no state. See [`Game::declare`].
     #[error("a declaration from {side:?} arrived with {to_move:?} to move")]
     NotToMove {
         /// The side that declared.
@@ -863,20 +875,18 @@ pub enum NotDeclarable {
 
 /// Why a `%CHUDAN` was not adjudicated.
 ///
-/// [`NotDeclarable`]'s pair, for [`Game::suspend`], and separate from it for the
-/// reason the two are separate methods: an error that says "a declaration"
-/// would misreport which line arrived. Neither variant is a *refused*
-/// suspension — a suspension is always refused, and the refusal is a
-/// termination rather than an error. These two are the cases where there was
-/// nothing to adjudicate at all.
+/// [`NotDeclarable`]'s pair, for [`Game::suspend`], and separate from it so
+/// that an error does not misreport which line arrived. Neither variant is a
+/// refused suspension: a suspension is always refused, and the refusal is a
+/// termination rather than an error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum NotSuspendable {
     /// The game had already ended. Nothing changed.
     #[error(transparent)]
     Finished(#[from] Finished),
 
-    /// A `%CHUDAN` from the side not to move: answered as P-4 answers a move
-    /// from the wrong side, altering no state. See [`Game::suspend`].
+    /// A `%CHUDAN` from the side not to move: answered the way a move from the
+    /// wrong side is answered, altering no state. See [`Game::suspend`].
     #[error("a %CHUDAN from {side:?} arrived with {to_move:?} to move")]
     NotToMove {
         /// The side that sent it.
@@ -888,21 +898,17 @@ pub enum NotSuspendable {
 
 /// Why a move was not applied.
 ///
-/// The four classes are separated because they are four different events to the
-/// task: one is a caller bug, one is P-4's protocol error, and two end the game
-/// with different reason lines. Collapsing any two would make a client's illegal
-/// move indistinguishable from a server mistake, or a loss on time from a loss
-/// on the rules.
+/// Four different events to the task: one is a caller bug, one is the protocol
+/// error, and two end the game with different reason lines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Rejected {
     /// The game had already ended. Nothing changed.
     #[error(transparent)]
     Finished(#[from] Finished),
 
-    /// A move from the side not to move: P-4's protocol error, which "alters no
-    /// state" and is **not** `#ILLEGAL_MOVE`. The project decision behind that
-    /// is on P-7's capture list, since shogi-server's source never emits
-    /// `#ILLEGAL_ACTION` and so does not settle it.
+    /// A move from the side not to move: a protocol error that alters no state
+    /// and is not `#ILLEGAL_MOVE`. This project decides that rather than the
+    /// reference, since shogi-server's source never emits `#ILLEGAL_ACTION`.
     #[error("a move from {side:?} arrived with {to_move:?} to move")]
     NotToMove {
         /// The side that sent it.
@@ -911,13 +917,11 @@ pub enum Rejected {
         to_move: Color,
     },
 
-    /// The flag fell before this move existed: [`Outcome::Timeout`] against the
-    /// side to move, which is `by`. P-5's termination, and **not** an illegal
-    /// move — it scores `#TIME_UP` rather than `#ILLEGAL_MOVE`, so collapsing
-    /// the two would send the wrong reason line.
+    /// The flag fell before this move existed: [`Outcome::Timeout`] against
+    /// the side to move, scoring `#TIME_UP` rather than `#ILLEGAL_MOVE`.
     ///
-    /// The move is not recorded and no clock moves; the numbers are here because
-    /// every caller logs them.
+    /// The move is not recorded and no clock moves; the numbers are here
+    /// because every caller logs them.
     #[error("{by:?} was charged {charged} against an allowance of {allowance}")]
     Timeout {
         /// The side whose allowance ran out: the side to move.
@@ -937,9 +941,8 @@ pub enum Rejected {
 /// The ply number the next entry takes: 1-based over the whole history, setup
 /// included.
 ///
-/// Saturating rather than casting: `Max_Moves` keeps a real game some four
-/// billion plies short of the ceiling, and a wrapped ply would number the record
-/// from zero again rather than fail.
+/// Saturating rather than casting: a wrapped ply would number the record from
+/// zero again rather than fail.
 fn next_ply(moves: &[PlayedMove]) -> u32 {
     u32::try_from(moves.len())
         .unwrap_or(u32::MAX)
@@ -948,11 +951,10 @@ fn next_ply(moves: &[PlayedMove]) -> u32 {
 
 /// Which side played setup move `index`.
 ///
-/// The parity `config::validate` establishes and [`setup_t_values`] places the
-/// reduction by: a sequence legal from hirate alternates strictly from Black, so
-/// even indices are Black's and odd ones White's. Asking the move itself is not
-/// an alternative — a [`Move`] carries no side, because which side plays it is a
-/// property of the position it is applied to.
+/// A sequence legal from hirate alternates strictly from Black, so even
+/// indices are Black's and odd ones White's. A [`Move`] carries no side to
+/// ask, because which side plays it is a property of the position it is
+/// applied to.
 const fn setup_mover(index: usize) -> Color {
     if index.is_multiple_of(2) {
         Color::Black
@@ -962,9 +964,6 @@ const fn setup_mover(index: usize) -> Color {
 }
 
 /// Index into a per-side array: `[black, white]`.
-///
-/// `Color`'s own index is private to [`game`](crate::game), on the same terms as
-/// [`agreement`](super::agreement)'s copy of this.
 const fn slot(side: Color) -> usize {
     match side {
         Color::Black => 0,
@@ -988,8 +987,7 @@ mod tests {
     /// subtraction rather than a saturation.
     const TOTAL: u32 = 1800;
 
-    /// A symmetric configuration: no increment, no floor, truncation. Each test
-    /// turns on exactly the keys it is about.
+    /// A symmetric configuration: no increment, no floor, truncation.
     fn config() -> TimeConfig {
         TimeConfig {
             unit: TimeUnit::Second,
@@ -1002,7 +1000,7 @@ mod tests {
         }
     }
 
-    /// The asymmetric worked example's `[time]` table: `1sec`, `Increment:2`, and 600 units off
+    /// An asymmetric `[time]` table: `1sec`, `Increment:2`, and 600 units off
     /// White's allowance — the configuration that produces the `T602` shape.
     fn asymmetric_example() -> TimeConfig {
         TimeConfig {
@@ -1044,7 +1042,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("{spec:?} failed to start: {error}"))
     }
 
-    /// The published-collection example of O-1, `7g7f 3c3d 2g2f`.
+    /// A three-ply setup sequence, `7g7f 3c3d 2g2f`.
     fn collection_example() -> Vec<Move> {
         vec![
             board((7, 7), (7, 6)),
@@ -1066,18 +1064,16 @@ mod tests {
         [game.remaining(Color::Black), game.remaining(Color::White)]
     }
 
-    /// Both clocks as a **client** computes them: P-5's rule,
+    /// Both clocks as a **client** computes them, by the client rule
     /// `remaining + increment − T`, folded over the T-values that side was sent.
     ///
-    /// Deliberately not `settled`: the identity is worth nothing if it is
-    /// asserted against the same expression that produced it. The fold is signed
-    /// and unclamped, so the clamp is a divergence it would catch rather than
-    /// reproduce, and nothing below folds a ledger that goes negative.
+    /// Not `settled`: the identity is worth nothing asserted against the
+    /// expression that produced it. The fold is signed and unclamped, so the
+    /// clamp is a divergence it would catch rather than reproduce.
     ///
-    /// Every entry's mover is its index's parity, for the reason
-    /// [`setup_mover`] states — which holds through the played moves too,
-    /// because a buoy history alternates strictly from Black at ply 1. A written
-    /// board need not, and no test folds one.
+    /// Every entry's mover is its index's parity, which holds through the
+    /// played moves too because a buoy history alternates strictly from Black
+    /// at ply 1. A written board need not, and no test folds one.
     fn client_ledger(game: &Game, cfg: &TimeConfig) -> [u32; 2] {
         let increment = i64::from(increment_units(cfg));
         let mut ledger = [i64::from(total_units(cfg)); 2];
@@ -1094,9 +1090,7 @@ mod tests {
     ///
     /// The entered king on the enemy home rank, ten pieces beside it worth
     /// eighteen points, and one point per pawn in hand — so `hand_pawns` alone
-    /// decides whether the declaration holds, at either threshold. The same
-    /// layout [`declaration`]'s own tests are built on; what these tests are
-    /// about is what a `Game` does with the verdict, not how it is reached.
+    /// decides whether the declaration holds, at either threshold.
     fn entered(declarer: Color, hand_pawns: u8) -> Position {
         // `1` is the enemy's home rank and `9` the declarer's own, so one
         // layout serves both colors.
@@ -1136,13 +1130,10 @@ mod tests {
         position
     }
 
-    /// The lines one client receives for a termination that echoes `text`, with
-    /// the shape the **verdict** chooses — which is the rule
-    /// [`Task::terminate`](super::pairing) applies on the wire.
-    ///
-    /// [`Task::terminate`]: super::pairing
+    /// The lines one client receives for a termination that echoes `text`,
+    /// with the shape the verdict chooses.
     fn echoed_lines(verdict: Verdict, text: &str, charged: u32, side: Color) -> Vec<String> {
-        let result = verdict.result(side);
+        let closing = verdict.closing(side);
         let termination = match verdict.echoing() {
             Echoing::Timed => Termination::with_echo(
                 MoveEcho {
@@ -1150,10 +1141,15 @@ mod tests {
                     consumed: charged,
                 },
                 verdict.reason(),
-                result,
+                closing,
             ),
-            Echoing::Bare => Termination::with_bare_echo(text, verdict.reason(), result),
-            Echoing::None => Termination::without_echo(verdict.reason(), result),
+            Echoing::Bare => Termination::with_bare_echo(text, verdict.reason(), closing),
+            // The verdict's own line wins over the caller's: nothing was
+            // received for this outcome.
+            Echoing::Fabricated(fixed) => {
+                Termination::with_bare_echo(fixed, verdict.reason(), closing)
+            }
+            Echoing::None => Termination::without_echo(verdict.reason(), closing),
         };
 
         termination.lines().map(|line| line.to_string()).collect()
@@ -1163,10 +1159,13 @@ mod tests {
     /// performs, so that a verdict is checked against the wire rather than
     /// against itself.
     fn lines(verdict: Verdict, echo: Option<MoveEcho<'_>>, side: Color) -> Vec<String> {
-        let result = verdict.result(side);
-        let termination = match echo {
-            Some(echo) => Termination::with_echo(echo, verdict.reason(), result),
-            None => Termination::without_echo(verdict.reason(), result),
+        let closing = verdict.closing(side);
+        let termination = match (verdict.echoing(), echo) {
+            (Echoing::Fabricated(text), _) => {
+                Termination::with_bare_echo(text, verdict.reason(), closing)
+            }
+            (_, Some(echo)) => Termination::with_echo(echo, verdict.reason(), closing),
+            (_, None) => Termination::without_echo(verdict.reason(), closing),
         };
 
         termination.lines().map(|line| line.to_string()).collect()
@@ -1239,9 +1238,9 @@ mod tests {
         assert!(game.moves().iter().all(|played| played.is_setup));
 
         // With no reduction each move is charged exactly the increment it is
-        // given back, so both clocks reach `START` at the full allowance —
-        // P-2's worked example, and what every client applying
-        // `remaining + increment − T` computes for itself.
+        // given back, so both clocks reach `START` at the full allowance, which
+        // is what every client applying `remaining + increment − T` computes
+        // for itself.
         assert_eq!(game.remaining(Color::Black), TOTAL);
         assert_eq!(game.remaining(Color::White), TOTAL);
         assert_eq!(client_ledger(&game, &cfg), game_clocks(&game));
@@ -1287,10 +1286,9 @@ mod tests {
 
     #[test]
     fn a_reduction_larger_than_the_allowance_clamps_rather_than_wrapping() {
-        // Not a configuration O-1 rejects, and a wrapped clock would read as a
-        // side with four billion units left. The clamp is the one case where
-        // the server's clock and an unclamped client ledger part company, and
-        // the configuration has no sensible reading anyway.
+        // A wrapped clock would read as a side with four billion units left.
+        // The clamp is the one case where the server's clock and an unclamped
+        // client ledger part company.
         let cfg = TimeConfig {
             total: TimeUnit::Second.duration(60),
             ..asymmetric_example()
@@ -1449,14 +1447,14 @@ mod tests {
             game.outcome(),
             Some(Outcome::Resignation { by: Color::White })
         );
-        assert_eq!(verdict.result(Color::White), GameResult::Lose);
+        assert_eq!(verdict.result(Color::White), Some(GameResult::Lose));
     }
 
     #[test]
     fn every_outcome_maps_to_its_reason_and_its_per_side_results() {
-        // P-7's table, variant by variant. The loser is written as the side the
-        // status is against, and the winner falls out of it.
-        let cases: [(Outcome, Reason, Scoring); 9] = [
+        // The termination table, variant by variant. The loser is written as
+        // the side the status is against, and the winner falls out of it.
+        let cases: [(Outcome, Reason, Scoring); 10] = [
             (
                 Outcome::Resignation { by: Color::Black },
                 Reason::Resign,
@@ -1497,9 +1495,10 @@ mod tests {
             (Outcome::MaxMoves, Reason::MaxMoves, Scoring::Draw),
             (
                 Outcome::Disconnected { by: Color::Black },
-                Reason::Censored,
+                Reason::Resign,
                 Scoring::Loser(Color::Black),
             ),
+            (Outcome::Aborted, Reason::Chudan, Scoring::Nobody),
         ];
 
         for (outcome, reason, scoring) in cases {
@@ -1510,18 +1509,38 @@ mod tests {
 
             match scoring {
                 Scoring::Loser(loser) => {
-                    assert_eq!(verdict.result(loser), GameResult::Lose, "{outcome:?}");
+                    assert_eq!(verdict.result(loser), Some(GameResult::Lose), "{outcome:?}");
                     assert_eq!(
                         verdict.result(loser.opponent()),
-                        GameResult::Win,
+                        Some(GameResult::Win),
                         "{outcome:?}"
                     );
                 }
                 Scoring::Draw => {
                     for side in [Color::Black, Color::White] {
-                        assert_eq!(verdict.result(side), GameResult::Draw, "{outcome:?}");
+                        assert_eq!(verdict.result(side), Some(GameResult::Draw), "{outcome:?}");
                     }
                 }
+                Scoring::Nobody => {
+                    for side in [Color::Black, Color::White] {
+                        assert_eq!(verdict.result(side), None, "{outcome:?}");
+                    }
+                    assert_eq!(verdict.results(), None, "{outcome:?}");
+                }
+            }
+
+            // The last line is the side's result for every outcome but the two
+            // that close with `#CENSORED`: `#MAX_MOVES`, whose two lines v1.2.1
+            // section 3.4 fixes, and the server's own abort, which has no
+            // result to write.
+            for side in [Color::Black, Color::White] {
+                let expected = match verdict.result(side) {
+                    Some(result) if !matches!(outcome, Outcome::MaxMoves) => {
+                        Closing::Result(result)
+                    }
+                    _ => Closing::Censored,
+                };
+                assert_eq!(verdict.closing(side), expected, "{outcome:?}");
             }
         }
     }
@@ -1531,40 +1550,56 @@ mod tests {
         for by in [Color::Black, Color::White] {
             let valid = termination_of(Outcome::Declaration { by, valid: true });
             assert_eq!(valid.reason(), Reason::Jishogi);
-            assert_eq!(valid.result(by), GameResult::Win);
-            assert_eq!(valid.result(by.opponent()), GameResult::Lose);
+            assert_eq!(valid.result(by), Some(GameResult::Win));
+            assert_eq!(valid.result(by.opponent()), Some(GameResult::Lose));
 
             let invalid = termination_of(Outcome::Declaration { by, valid: false });
             assert_eq!(invalid.reason(), Reason::IllegalMove);
-            assert_eq!(invalid.result(by), GameResult::Lose);
-            assert_eq!(invalid.result(by.opponent()), GameResult::Win);
+            assert_eq!(invalid.result(by), Some(GameResult::Lose));
+            assert_eq!(invalid.result(by.opponent()), Some(GameResult::Win));
         }
     }
 
     #[test]
-    fn max_moves_is_a_draw_for_both_sides() {
-        // shogi-server's GameResultMaxMovesDraw, quoted by P-7: the
-        // specification lists the status without fixing the result.
+    fn max_moves_closes_with_censored_and_is_scored_a_draw_for_both_sides() {
+        // Two rules at once, and they deliberately disagree. On the wire,
+        // v1.2.1 section 3.4: 「サーバは `#MAX_MOVES` `#CENSORED` と、規定手数への到達を
+        // 示す 1 行目の情報と、対局が打ち切られたことを表す 2 行目の情報の計 2 行
+        // を双方に送る」, which is also what shogi-server sends
+        // (`GameResultMaxMovesDraw#process`: `"#MAX_MOVES\n#CENSORED\n"`).
+        // Off the wire the same reference scores it a draw, and so does this.
         let verdict = termination_of(Outcome::MaxMoves);
 
         assert_eq!(verdict.reason(), Reason::MaxMoves);
-        assert_eq!(lines(verdict, None, Color::Black), ["#MAX_MOVES", "#DRAW"]);
+        assert_eq!(verdict.scoring(), Scoring::Draw);
+
+        for side in [Color::Black, Color::White] {
+            assert_eq!(verdict.result(side), Some(GameResult::Draw), "{side:?}");
+            assert_eq!(verdict.closing(side), Closing::Censored, "{side:?}");
+            assert_eq!(
+                lines(verdict, None, side),
+                ["#MAX_MOVES", "#CENSORED"],
+                "{side:?}"
+            );
+        }
     }
 
     #[test]
     fn only_the_outcomes_with_nothing_accepted_omit_the_echo() {
-        // `#CENSORED` received nothing; `#TIME_UP` accepted nothing — a T-value
-        // there would announce a deduction that never happened, on either of
-        // its two paths.
+        // `#TIME_UP` accepted nothing, on either of its two paths, and a
+        // T-value there would announce a deduction that never happened. The
+        // server's abort received nothing to echo either. A disconnect
+        // received nothing and still writes the server's own `%TORYO`.
         for outcome in [
-            Outcome::Disconnected { by: Color::Black },
             Outcome::Timeout { by: Color::Black },
             Outcome::Timeout { by: Color::White },
+            Outcome::Aborted,
         ] {
             assert!(!termination_of(outcome).is_echoed(), "{outcome:?}");
         }
 
         for outcome in [
+            Outcome::Disconnected { by: Color::Black },
             Outcome::Resignation { by: Color::Black },
             Outcome::Declaration {
                 by: Color::Black,
@@ -1581,6 +1616,115 @@ mod tests {
         ] {
             assert!(termination_of(outcome).is_echoed(), "{outcome:?}");
         }
+    }
+
+    #[test]
+    fn every_outcome_has_a_record_word_and_a_declaration_splits_on_validity() {
+        // The record's vocabulary, exhaustively.
+        let expected = [
+            (Outcome::Resignation { by: Color::Black }, Ending::Toryo),
+            (
+                Outcome::Declaration {
+                    by: Color::Black,
+                    valid: true,
+                },
+                Ending::Kachi,
+            ),
+            (
+                Outcome::Declaration {
+                    by: Color::Black,
+                    valid: false,
+                },
+                Ending::IllegalKachi,
+            ),
+            (
+                Outcome::IllegalMove { by: Color::White },
+                Ending::IllegalMove,
+            ),
+            (Outcome::Timeout { by: Color::White }, Ending::TimeUp),
+            (Outcome::Repetition, Ending::Sennichite),
+            (
+                Outcome::PerpetualCheck { by: Color::Black },
+                Ending::OuteSennichite,
+            ),
+            (Outcome::MaxMoves, Ending::MaxMoves),
+            (Outcome::Disconnected { by: Color::White }, Ending::Abnormal),
+            (Outcome::Aborted, Ending::Chudan),
+        ];
+
+        for (outcome, ending) in expected {
+            assert_eq!(record_ending(outcome), ending, "{outcome:?}");
+        }
+
+        // Ten rows for nine outcomes, the declaration counted twice. The count
+        // is asserted so a row deleted here is noticed.
+        assert_eq!(expected.len(), 10);
+    }
+
+    #[test]
+    fn the_servers_abort_sends_chudan_and_censored_and_scores_nobody() {
+        // The specification's `#CHUDAN` for what happened, then section 3.4's
+        // `#CENSORED` for the game having been broken off. Neither side reads
+        // a result, because there is none.
+        let verdict = termination_of(Outcome::Aborted);
+
+        assert_eq!(verdict.reason(), Reason::Chudan);
+        assert_eq!(verdict.scoring(), Scoring::Nobody);
+        assert_eq!(verdict.results(), None);
+        for side in [Color::Black, Color::White] {
+            assert_eq!(lines(verdict, None, side), ["#CHUDAN", "#CENSORED"]);
+        }
+    }
+
+    #[test]
+    fn a_game_the_server_aborts_ends_with_no_winner_and_records_no_charge() {
+        let mut game = game(&buoy(&[]), &config());
+        let before = [
+            game.remaining(Color::Black),
+            game.remaining(Color::White),
+            u32::try_from(game.moves().len()).expect("a short move list"),
+        ];
+
+        let verdict = game.abort().expect("a running game can be aborted");
+
+        assert_eq!(game.outcome(), Some(Outcome::Aborted));
+        assert_eq!(verdict.results(), None);
+        // Nothing was played and nothing was deducted: the abort is the
+        // server's act, not either engine's.
+        assert_eq!(
+            [
+                game.remaining(Color::Black),
+                game.remaining(Color::White),
+                u32::try_from(game.moves().len()).expect("a short move list"),
+            ],
+            before
+        );
+
+        // And a second abort changes nothing: the outcome already recorded is
+        // what comes back.
+        assert_eq!(
+            game.abort(),
+            Err(Finished {
+                outcome: Outcome::Aborted
+            })
+        );
+    }
+
+    #[test]
+    fn a_game_that_already_ended_is_not_aborted_over_its_own_result() {
+        let mut game = game(&buoy(&[]), &config());
+        game.resign(Color::Black, 0).expect("Black may resign");
+
+        assert_eq!(
+            game.abort(),
+            Err(Finished {
+                outcome: Outcome::Resignation { by: Color::Black }
+            })
+        );
+        assert_eq!(
+            game.outcome(),
+            Some(Outcome::Resignation { by: Color::Black })
+        );
     }
 
     #[test]
@@ -1614,8 +1758,8 @@ mod tests {
             Some(Outcome::IllegalMove { by: Color::Black })
         );
         assert_eq!(verdict.reason(), Reason::IllegalMove);
-        assert_eq!(verdict.result(Color::Black), GameResult::Lose);
-        assert_eq!(verdict.result(Color::White), GameResult::Win);
+        assert_eq!(verdict.result(Color::Black), Some(GameResult::Lose));
+        assert_eq!(verdict.result(Color::White), Some(GameResult::Win));
         assert_eq!(
             echoed_lines(verdict, "%CHUDAN", 12, Color::Black),
             ["%CHUDAN,T12", "#ILLEGAL_MOVE", "#LOSE"]
@@ -1625,16 +1769,14 @@ mod tests {
             ["%CHUDAN,T12", "#ILLEGAL_MOVE", "#WIN"]
         );
 
-        // Written, so deducted (invariant 4) — and nothing is recorded, since
-        // no move was played.
+        // Written, so deducted — and nothing is recorded, since no move was
+        // played.
         assert_eq!(game.remaining(Color::Black), TOTAL - 12);
         assert!(game.moves().is_empty());
     }
 
-    /// The wire is the illegal move's, with nothing added: one verdict, reached
-    /// two ways. What differs between the two games is the line each client
-    /// sent, and that is the client's text rather than anything this server
-    /// spells.
+    /// The wire is the illegal move's, with nothing added: what differs
+    /// between the two games is the line each client sent.
     #[test]
     fn a_chudan_and_an_illegal_move_end_the_game_with_the_same_verdict() {
         let mut suspended = game(&buoy(&[]), &config());
@@ -1653,7 +1795,7 @@ mod tests {
         assert_eq!(game_clocks(&suspended), game_clocks(&played));
     }
 
-    /// P-4's answer to a line from the side not to move, which alters no state
+    /// The answer to a line from the side not to move, which alters no state
     /// and sends nothing. The reference reads a special move only from the
     /// current player, so there is nothing here to adjudicate.
     #[test]
@@ -1689,7 +1831,7 @@ mod tests {
 
         assert_eq!(game.outcome(), Some(Outcome::Timeout { by: Color::Black }));
         assert_eq!(verdict.reason(), Reason::TimeUp);
-        assert_eq!(verdict.result(Color::Black), GameResult::Lose);
+        assert_eq!(verdict.result(Color::Black), Some(GameResult::Lose));
         assert!(!verdict.is_echoed(), "a flag echoes nothing");
         assert_eq!(game_clocks(&game), game_clocks(&before));
     }
@@ -1709,12 +1851,34 @@ mod tests {
         assert_eq!(game, after);
     }
 
+    /// shogi-server's `GameResultAbnormalWin#process`:
+    /// `"%TORYO\n#RESIGN\n#WIN\n"` to the winner and
+    /// `"%TORYO\n#RESIGN\n#LOSE\n"` to the loser. The specification says
+    /// nothing about a dropped connection, so the reference governs, and the
+    /// `%TORYO` is bare since nothing was received and nothing is deducted.
     #[test]
-    fn a_disconnection_sends_two_lines_and_scores_against_the_side_that_went_away() {
+    fn a_disconnection_ends_as_a_resignation_by_the_side_that_went_away() {
         let verdict = termination_of(Outcome::Disconnected { by: Color::White });
 
-        assert_eq!(lines(verdict, None, Color::White), ["#CENSORED", "#LOSE"]);
-        assert_eq!(lines(verdict, None, Color::Black), ["#CENSORED", "#WIN"]);
+        assert_eq!(
+            lines(verdict, None, Color::White),
+            ["%TORYO", "#RESIGN", "#LOSE"]
+        );
+        assert_eq!(
+            lines(verdict, None, Color::Black),
+            ["%TORYO", "#RESIGN", "#WIN"]
+        );
+
+        // The record still tells the two apart: a resignation is `toryo` and
+        // this is `abnormal`, which is where the reference draws the line too.
+        assert_eq!(
+            record_ending(Outcome::Disconnected { by: Color::White }),
+            Ending::Abnormal
+        );
+        assert_eq!(
+            record_ending(Outcome::Resignation { by: Color::White }),
+            Ending::Toryo
+        );
     }
 
     #[test]
@@ -1758,10 +1922,9 @@ mod tests {
 
     #[test]
     fn the_client_rule_reaches_the_servers_clocks_after_every_settlement() {
-        // P-5's completion criterion, as an executable fact: "a client applying
-        // `remaining + increment − T` with no server-specific code reaches the
-        // correct remaining time for both sides". Setup entries and played ones
-        // alike, after each event rather than only at the end.
+        // A client applying `remaining + increment − T` reaches the correct
+        // remaining time for both sides, after each event rather than only at
+        // the end.
         let cfg = TimeConfig {
             increment: Some(Duration::from_secs(2)),
             ..config()
@@ -1935,8 +2098,8 @@ mod tests {
         // declaration is not exempt.
         assert_eq!(game.outcome(), Some(Outcome::Timeout { by: Color::Black }));
         assert_eq!(verdict.reason(), Reason::TimeUp);
-        assert_eq!(verdict.result(Color::Black), GameResult::Lose);
-        assert_eq!(verdict.result(Color::White), GameResult::Win);
+        assert_eq!(verdict.result(Color::Black), Some(GameResult::Lose));
+        assert_eq!(verdict.result(Color::White), Some(GameResult::Win));
         // Nothing settled: the charge is not deducted after the flag.
         assert_eq!(game_clocks(&game), game_clocks(&before));
     }
@@ -1962,8 +2125,8 @@ mod tests {
         assert_eq!(game.remaining(Color::Black), TOTAL);
     }
 
-    /// P-7 and the reference's own strings: `%KACHI`, `#JISHOGI`, the result —
-    /// the echo bare, with no consumption time.
+    /// The termination table and the reference's own strings: `%KACHI`,
+    /// `#JISHOGI`, the result — the echo bare, with no consumption time.
     #[test]
     fn a_declaration_that_holds_wins_with_the_reference_exchange() {
         let mut game = game(&StartSpec::Board(entered(Color::Black, 10)), &config());
@@ -1980,8 +2143,8 @@ mod tests {
             })
         );
         assert_eq!(verdict.reason(), Reason::Jishogi);
-        assert_eq!(verdict.result(Color::Black), GameResult::Win);
-        assert_eq!(verdict.result(Color::White), GameResult::Lose);
+        assert_eq!(verdict.result(Color::Black), Some(GameResult::Win));
+        assert_eq!(verdict.result(Color::White), Some(GameResult::Lose));
 
         assert_eq!(
             echoed_lines(verdict, "%KACHI", 3, Color::Black),
@@ -2069,8 +2232,8 @@ mod tests {
         assert_eq!(client_ledger(&game, &cfg), game_clocks(&game));
     }
 
-    /// P-5 ahead of the adjudication, exactly as it is ahead of a resignation:
-    /// the flag fell before the declaration existed, so nothing is judged.
+    /// The flag ahead of the adjudication, exactly as it is ahead of a
+    /// resignation: it fell before the declaration existed, so nothing is judged.
     #[test]
     fn a_kachi_from_the_side_to_move_that_arrived_too_late_is_a_flag() {
         // A position that would win outright, so what decides this is the clock
@@ -2084,14 +2247,14 @@ mod tests {
 
         assert_eq!(game.outcome(), Some(Outcome::Timeout { by: Color::Black }));
         assert_eq!(verdict.reason(), Reason::TimeUp);
-        assert_eq!(verdict.result(Color::Black), GameResult::Lose);
-        assert_eq!(verdict.result(Color::White), GameResult::Win);
+        assert_eq!(verdict.result(Color::Black), Some(GameResult::Lose));
+        assert_eq!(verdict.result(Color::White), Some(GameResult::Win));
         assert!(!verdict.is_echoed(), "a flag echoes nothing");
         assert_eq!(game_clocks(&game), game_clocks(&before));
     }
 
     /// A claim about the position on one's own turn: out of turn there is
-    /// nothing to judge, and P-4's answer to a move from the wrong side is the
+    /// nothing to judge, and the answer to a move from the wrong side is the
     /// one that applies. Not a failed declaration — that would end the game
     /// against a player whose claim was never read.
     #[test]
@@ -2117,7 +2280,7 @@ mod tests {
     /// The board a declaration is judged against is the one the **setup**
     /// built, hirate being one value of that path rather than a case of its own.
     ///
-    /// The setup is what makes this test possible at all: after O-1's published
+    /// The setup is what makes this test possible at all: after the published
     /// three-ply entry it is White's turn, so White's declaration is judged and
     /// Black's is out of turn. From the hirate the same buoy is replayed from,
     /// both answers would be the other way round.
@@ -2145,7 +2308,7 @@ mod tests {
             })
         );
         assert_eq!(verdict.reason(), Reason::IllegalMove);
-        assert_eq!(verdict.result(Color::White), GameResult::Lose);
+        assert_eq!(verdict.result(Color::White), Some(GameResult::Lose));
     }
 
     #[test]
@@ -2228,8 +2391,8 @@ mod tests {
             .expect("the measured charge reaches the allowance");
 
         assert_eq!(verdict.reason(), Reason::TimeUp);
-        assert_eq!(verdict.result(Color::Black), GameResult::Lose);
-        assert_eq!(verdict.result(Color::White), GameResult::Win);
+        assert_eq!(verdict.result(Color::Black), Some(GameResult::Lose));
+        assert_eq!(verdict.result(Color::White), Some(GameResult::Win));
         assert!(!verdict.is_echoed());
         assert_eq!(game.outcome(), Some(Outcome::Timeout { by: Color::Black }));
 
@@ -2307,7 +2470,7 @@ mod tests {
     ///
     /// The varying charge is the point of the helper: a clock that differed at a
     /// recurrence would prevent the recurrence if a clock were part of a
-    /// position's identity. P-6 says it is not, and every one of these games
+    /// position's identity. It is not, and every one of these games
     /// reaches its verdict with both clocks at values they have never held
     /// before.
     fn play_shuttles(game: &mut Game, count: usize) -> Vec<Option<Outcome>> {
@@ -2327,7 +2490,7 @@ mod tests {
     #[test]
     fn a_dummy_buoy_start_holds_two_occurrences_and_two_live_shuttles_finish_the_four() {
         // The transmitted shuttle returns exactly to hirate, so hirate occurs at
-        // ply 0 and again at ply 4 before a client has moved at all (P-6). Two
+        // ply 0 and again at ply 4 before a client has moved at all. Two
         // live shuttles are then all that is left.
         let mut game = game(&buoy(&KING_SHUTTLE), &config());
         assert_eq!(game.moves().len(), 4);
@@ -2348,7 +2511,8 @@ mod tests {
         assert_eq!(game.moves().last().map(|played| played.t), Some(8));
         assert_eq!(game.position(), &Position::hirate());
 
-        // And P-7's three lines, the echo being the relay of that move.
+        // And the termination's three lines, the echo being the relay of that
+        // move.
         let verdict = termination_of(Outcome::Repetition);
         let echo = MoveEcho {
             text: "-5251OU",
@@ -2524,7 +2688,8 @@ mod tests {
         assert_eq!(outcomes[5], Some(Outcome::MaxMoves));
 
         // The reaching move is played, recorded and charged, exactly as a
-        // repetition's is: P-7 echoes it before the two lines that follow.
+        // repetition's is: the termination echoes it before the two lines that
+        // follow.
         assert_eq!(plies(&game), (1..=6).collect::<Vec<_>>());
         assert_eq!(game.moves().last().map(|played| played.t), Some(1));
         let verdict = termination_of(Outcome::MaxMoves);
@@ -2535,7 +2700,7 @@ mod tests {
         for side in [Color::Black, Color::White] {
             assert_eq!(
                 lines(verdict, Some(echo), side),
-                ["-8485FU,T1", "#MAX_MOVES", "#DRAW"]
+                ["-8485FU,T1", "#MAX_MOVES", "#CENSORED"]
             );
         }
     }
@@ -2557,7 +2722,7 @@ mod tests {
 
     #[test]
     fn a_setup_sequence_spends_the_limit_it_is_counted_under() {
-        // PRD A2: the limit applies to the whole transmitted game, so a
+        // The limit applies to the whole transmitted game, so a
         // three-ply setup under a limit of six leaves three plies to play.
         let mut game = limited(&buoy(&collection_example()), &config(), Some(6));
         assert_eq!(game.moves().len(), 3);
@@ -2627,8 +2792,9 @@ mod tests {
 
     #[test]
     fn a_setup_that_already_meets_the_limit_ends_on_the_first_real_move() {
-        // O-1 keeps a configured collection away from this, and the reading is
-        // `config/validate.rs`'s own: "otherwise the game ends `#MAX_MOVES` at
+        // Startup validation keeps a configured collection away from this, and
+        // the reading is `config/validate.rs`'s own: "otherwise the game ends
+        // `#MAX_MOVES` at
         // move one". It needs no special case — `>=` over the whole history is
         // the whole of it.
         let mut game = limited(&buoy(&collection_example()), &config(), Some(2));
@@ -2647,7 +2813,7 @@ mod tests {
 
     #[test]
     fn the_allowance_a_game_reports_is_the_clock_plus_byoyomi_and_increment() {
-        // What the wiring slice arms its deadline with, asked of the game
+        // What the game task arms its move deadline with, asked of the game
         // rather than of the configuration — the point being that it moves as
         // the clock does.
         let cfg = TimeConfig {

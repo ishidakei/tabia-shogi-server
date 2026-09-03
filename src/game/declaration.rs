@@ -1,34 +1,27 @@
 //! `%KACHI` adjudicated: the jishogi declaration under the 27-point rule.
 //!
-//! `Game_Summary` announces `Declaration:Jishogi 1.1`, which is the JSA
-//! 27-point declaration, and this module is the whole of what that announcement
-//! promises. It answers one question — does the declaration hold — and does not
-//! know that the answer is spelled `#JISHOGI` or `#ILLEGAL_MOVE` on the wire
-//! (invariant 1: `game/` names no protocol token).
+//! `Game_Summary` announces `Declaration:Jishogi 1.1`, the JSA 27-point
+//! declaration, and this module is the whole of what that announcement
+//! promises. The rule is claimed by the player on turn: [`holds`] is asked,
+//! never offered.
 //!
-//! **Nothing here volunteers a declaration.** The rule is claimed by the player
-//! on turn; a server that adjudicated a position nobody claimed would be
-//! inventing a termination. [`holds`] is asked, never offered.
-//!
-//! **The reference's four conditions, in its own order** (`board.rb`,
+//! The reference's four conditions, in its own order (`board.rb`,
 //! `good_kachi?`, reached from `handle_one_move` with the declarer as the
 //! current player):
 //!
 //! 1. the declarer's king is not in check;
 //! 2. the declarer's king stands in the enemy camp — the same three ranks a
-//!    move promotes in, which is why the test is
-//!    [`legality`](super::legality)'s and not a second rank rule written here;
+//!    move promotes in;
 //! 3. at least [`REQUIRED_PIECES`] of the declarer's pieces, the king aside,
 //!    stand in those three ranks;
-//! 4. the points reach [`required_points`] — the declarer's pieces in the enemy
-//!    camp plus **every** piece in hand, a rook or a bishop counting
-//!    [`MAJOR_POINTS`] promoted or not, every other piece [`MINOR_POINTS`], and
-//!    the king nothing.
+//! 4. the points reach [`required_points`] — the declarer's pieces in the
+//!    enemy camp plus every piece in hand, a rook or a bishop counting
+//!    [`MAJOR_POINTS`] promoted or not, every other piece [`MINOR_POINTS`],
+//!    and the king nothing.
 //!
-//! Hand pieces count toward the points and **not** toward the piece count: the
+//! Hand pieces count toward the points and not toward the piece count: the
 //! reference sums the hands into `point` alone, and reads `number` from the
-//! camp ranks only. The two counts are therefore taken in one pass over the
-//! camp and one pass over the hand, so neither can drift into the other.
+//! camp ranks only.
 
 use super::legality::{in_check, in_promotion_zone, squares};
 use super::position::{Color, HandKind, PieceKind, Position};
@@ -45,10 +38,9 @@ pub const MINOR_POINTS: u32 = 1;
 
 /// The point total `declarer` must reach.
 ///
-/// The two thresholds differ by one, and that asymmetry is the rule's own: the
-/// 27 points of a shared board split 27/27 with a point left over, so the side
-/// that moves first is asked for the larger half. Sente 28, gote 27 —
-/// shogi-server's `if (sente) then point < 28 else point < 27`.
+/// The two thresholds differ by one, and that asymmetry is the rule's own:
+/// sente 28, gote 27 — shogi-server's
+/// `if (sente) then point < 28 else point < 27`.
 pub const fn required_points(declarer: Color) -> u32 {
     match declarer {
         Color::Black => 28,
@@ -59,8 +51,7 @@ pub const fn required_points(declarer: Color) -> u32 {
 /// What `kind` is worth to a declaration.
 ///
 /// The king is worth nothing, which is also what keeps it out of the piece
-/// count: the reference counts exactly the pieces whose point value is above
-/// zero.
+/// count: the reference counts exactly the pieces whose value is above zero.
 pub const fn points(kind: PieceKind) -> u32 {
     match kind {
         PieceKind::King => 0,
@@ -83,14 +74,12 @@ pub const fn points(kind: PieceKind) -> u32 {
 /// Whether a `%KACHI` from `declarer` holds against `position`.
 ///
 /// All four conditions, and no fifth: whether it is `declarer`'s turn is the
-/// caller's question, because a declaration out of turn is a protocol matter
-/// rather than a failed adjudication — the reference never reaches
-/// `good_kachi?` with anyone but the current player.
+/// caller's question, and the reference never reaches `good_kachi?` with
+/// anyone but the current player.
 ///
-/// A declarer with **no king on the board** cannot declare. That case cannot
-/// arise in a game this server started, but [`in_check`] answers `false` for a
-/// kingless color by design, so leaving the king unfound would turn the missing
-/// king into a passed condition rather than a failed one.
+/// A declarer with no king on the board cannot declare. [`in_check`] answers
+/// `false` for a kingless color, so leaving the king unfound would turn the
+/// missing king into a passed condition rather than a failed one.
 pub fn holds(position: &Position, declarer: Color) -> bool {
     if in_check(position, declarer) {
         return false;
@@ -121,13 +110,9 @@ fn king_entered(position: &Position, declarer: Color) -> bool {
     })
 }
 
-/// What the enemy camp's three ranks hold for `declarer`: the pieces that count
-/// toward [`REQUIRED_PIECES`], and what they are worth.
-///
-/// One pass, so the count and the sum are taken over exactly the same squares.
-/// The king is excluded from both, which is one exclusion rather than two: it
-/// is worth nothing, so dropping the zero-point pieces from the count drops
-/// precisely it.
+/// What the enemy camp's three ranks hold for `declarer`: the pieces that
+/// count toward [`REQUIRED_PIECES`], and what they are worth. One pass, so the
+/// count and the sum are taken over exactly the same squares.
 fn camp_census(position: &Position, declarer: Color) -> Census {
     let mut census = Census {
         pieces: 0,
@@ -152,10 +137,8 @@ fn camp_census(position: &Position, declarer: Color) -> Census {
     census
 }
 
-/// What `declarer` holds in hand, in points.
-///
-/// Every piece, wherever the declarer's own pieces stand: a hand is not on the
-/// board, so no camp test applies to it.
+/// What `declarer` holds in hand, in points. A hand is not on the board, so no
+/// camp test applies to it.
 fn hand_points(position: &Position, declarer: Color) -> u32 {
     let hand = position.hand(declarer);
     HandKind::ALL
@@ -179,7 +162,6 @@ mod tests {
 
     use crate::game::position::{Piece, Square};
 
-    /// Every kind, so the point table can be quantified over all fourteen.
     const ALL_KINDS: [PieceKind; 14] = [
         PieceKind::King,
         PieceKind::Rook,
@@ -201,11 +183,7 @@ mod tests {
         Square::new(file, rank).expect("test coordinate is on the board")
     }
 
-    /// An empty board, both hands empty, `declarer` to move.
-    ///
-    /// Built by emptying hirate rather than by a constructor of its own: a
-    /// position with no king is not a value this crate hands out, and it exists
-    /// here only as the blank the layouts below are written onto. Hirate's own
+    /// An empty board, both hands empty, `declarer` to move. Hirate's own
     /// hands are already empty, so clearing the board clears everything.
     fn empty(declarer: Color) -> Position {
         let mut position = Position::hirate();
@@ -219,8 +197,7 @@ mod tests {
     }
 
     /// A rank in `declarer`'s terms: `1` is the enemy's home rank, `9` the
-    /// declarer's own. One layout below therefore serves both colors, and the
-    /// mirror is written once instead of at every coordinate.
+    /// declarer's own, so one layout below serves both colors.
     const fn rank(declarer: Color, from_enemy_home: u8) -> u8 {
         match declarer {
             Color::Black => from_enemy_home,
@@ -228,16 +205,11 @@ mod tests {
         }
     }
 
-    /// A declaration-ready layout for `declarer`, with `hand_pawns` pawns held.
-    ///
-    /// Ten pieces in the enemy camp beside the entered king — a rook and a
-    /// bishop at five points each and eight one-point pieces, so eighteen from
-    /// the board — plus one point per pawn in hand. `hand_pawns` is therefore
-    /// the whole of what varies between a declaration that holds and one that
-    /// is a point short, at either threshold.
-    ///
-    /// The enemy king stands on its own home rank, far from anything, so the
-    /// declarer is not in check by accident.
+    /// A declaration-ready layout for `declarer`, with `hand_pawns` pawns
+    /// held: ten pieces in the enemy camp beside the entered king, eighteen
+    /// points from the board, plus one point per pawn in hand. The enemy king
+    /// stands on its own home rank, far from anything, so the declarer is not
+    /// in check by accident.
     fn entered(declarer: Color, hand_pawns: u8) -> Position {
         let mut position = empty(declarer);
 
@@ -270,9 +242,6 @@ mod tests {
         position
     }
 
-    /// The count and the sum the layout is built to produce, asserted before
-    /// anything reads a verdict off it: a test that silently built nine pieces
-    /// would otherwise pass for the wrong reason.
     #[test]
     fn the_layout_is_ten_pieces_and_eighteen_points_in_the_camp() {
         for declarer in [Color::Black, Color::White] {

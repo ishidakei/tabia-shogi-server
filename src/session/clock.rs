@@ -1,32 +1,20 @@
 //! Clock arithmetic: charged units, setup T-values, and the dummy buoy.
 //!
-//! This module owns consumption, timeout, and setup T-values. The computation
-//! is here rather than in the codec because the rule about which value is
-//! written — the one the server actually deducts — is a time-control decision,
-//! not a formatting one: `clock.rs` computes the T-values, and
-//! `csa/position_block.rs` merely encodes them.
+//! One rule is the whole of this file: the T-value written equals the time
+//! deducted, so a client applying `remaining + increment − T` reaches the
+//! remaining time the server holds. [`charged_units`] is the single value the
+//! relay both writes and deducts, and [`setup_t_values`] is the deduction
+//! chosen for a move that consumed nothing. Shogi-server writes `,T1` without
+//! deducting it, which desynchronizes any client reading T as real
+//! consumption, and the drift grows with the setup length.
 //!
-//! **Invariant 4 is the whole of this file.** The T-value written equals the
-//! time deducted, so a client applying `remaining + increment − T` reaches the
-//! remaining time the server holds. [`charged_units`] is the single value P-4
-//! both writes and deducts, and [`setup_t_values`] is the deduction chosen for
-//! a move that consumed nothing. Shogi-server writes `,T1` without deducting
-//! it, which desynchronizes any client reading T as real consumption, and the
-//! drift grows with the setup length.
-//!
-//! Nothing here measures anything. What elapsed between the relay of one move
-//! and the receipt of the next is the game task's (P-4), and so is the timer
-//! that makes a player who sends nothing at all flag. What is here is every
-//! number those two use — [`turn_allowance`], the ceiling one turn may spend,
-//! and [`flag_after`], the elapsed duration that ceiling falls at — and all of
-//! it is testable with no socket and no timer.
+//! Nothing here measures anything: what elapsed between the relay of one move
+//! and the receipt of the next is the game task's, and so is the timer. What
+//! is here is every number those two use.
 //!
 //! [`flag_after`] is beside [`charged_units`] because it is that function
-//! inverted at its boundary: the earliest elapsed whose charge reaches an
-//! allowance. Deriving it anywhere else would be a second reading of
-//! `Time_Roundup` and of `Least_Time_Per_Move`, and a deadline that disagreed
-//! with the verdict it exists to anticipate is exactly the failure this module's
-//! one-conversion rule is against.
+//! inverted at its boundary. Deriving it anywhere else would be a second
+//! reading of `Time_Roundup` and of `Least_Time_Per_Move`.
 
 use std::time::Duration;
 
@@ -35,18 +23,15 @@ use crate::game::{Color, Move, Square, StartSpec};
 
 /// The dummy buoy: `+5958OU -5152OU +5859OU -5251OU`.
 ///
-/// Both kings step out and back, returning exactly to hirate. Always legal from
-/// hirate; used only to carry T-values when a hirate entry needs a reduction.
+/// Both kings step out and back, returning exactly to hirate. Always legal
+/// from hirate; used only to carry T-values when a hirate entry needs a
+/// reduction.
 ///
-/// **Fixed, never generated per position.**
-/// A generated null sequence would be a second thing that has to be legal from
-/// the position it is generated for, and the only position this is ever applied
-/// to is hirate.
+/// Fixed, never generated per position: a generated null sequence would have
+/// to be legal from the position it was generated for.
 ///
-/// [`effective_setup`] is the one place that decides to transmit it. Its
-/// consequence for repetition — the transmitted position occurs at ply 0 and
-/// again at ply 4, so a game starts with **two** occurrences — is P-6's, and
-/// stated there.
+/// A game transmitted with it starts with two occurrences of hirate — one at
+/// ply 0 and one at ply 4.
 pub const KING_SHUTTLE: [Move; 4] = [
     step(5, 9, 5, 8),
     step(5, 1, 5, 2),
@@ -56,9 +41,9 @@ pub const KING_SHUTTLE: [Move; 4] = [
 
 /// One quiet board move, at compile time.
 ///
-/// `Square::new` is `const` and returns an `Option`, so the four squares of
-/// [`KING_SHUTTLE`] are checked where they are written: an off-board coordinate
-/// would fail the build rather than the first game played under a reduction.
+/// `Square::new` is `const` and returns an `Option`, so an off-board
+/// coordinate in [`KING_SHUTTLE`] fails the build rather than the first game
+/// played under a reduction.
 const fn step(from_file: u8, from_rank: u8, to_file: u8, to_rank: u8) -> Move {
     Move::Board {
         from: square(from_file, from_rank),
@@ -77,14 +62,14 @@ const fn square(file: u8, rank: u8) -> Square {
 
 /// What one real move costs: the value written as `T` and the value deducted.
 ///
-/// `elapsed` is converted to `Time_Unit`s under `Time_Roundup` and then floored
-/// at `Least_Time_Per_Move` — "minimum time recorded per move" (v1.2.1 §3),
-/// and what is recorded is a count of units, so the floor is compared in units
-/// rather than in [`Duration`]s.
+/// `elapsed` is converted to `Time_Unit`s under `Time_Roundup` and then
+/// floored at `Least_Time_Per_Move` — "minimum time recorded per move" (v1.2.1
+/// section 3) — and what is recorded is a count of units, so the floor is
+/// compared in units rather than in [`Duration`]s.
 ///
-/// One function rather than two, deliberately. P-4 relays `<move>,T<this>` and
-/// subtracts `this` from the mover's remaining time; a second computation for
-/// the second use is how invariant 4 breaks silently.
+/// One function rather than two: the relay writes `<move>,T<this>` and
+/// subtracts `this` from the mover's remaining time, and a second computation
+/// for the second use is how the two drift apart.
 pub fn charged_units(elapsed: Duration, cfg: &TimeConfig) -> u32 {
     let floor = units_of(cfg.least_time_per_move, cfg.unit, cfg.roundup);
 
@@ -93,15 +78,13 @@ pub fn charged_units(elapsed: Duration, cfg: &TimeConfig) -> u32 {
 
 /// `Total_Time` as a count of `Time_Unit`s: what each side's clock starts at.
 ///
-/// The counterpart of [`charged_units`] at the other end of a game, and
-/// deliberately without its `Least_Time_Per_Move` floor — a floor on an
-/// allowance is not a thing the specification has.
+/// Without [`charged_units`]'s `Least_Time_Per_Move` floor, since a floor on
+/// an allowance is not a thing the specification has.
 ///
-/// Here rather than beside the clock that holds the number, for this module's
-/// stated contract: a remaining time counted in units and a T-value deducted
-/// from it must be counted the same way, and the way they are counted is
-/// `units_of`, which is private and stays so. A configured duration converts
-/// exactly, so `Time_Roundup` cannot change this value.
+/// Here rather than beside the clock that holds the number, because a
+/// remaining time counted in units and a T-value deducted from it must be
+/// counted the same way. A configured duration converts exactly, so
+/// `Time_Roundup` cannot change this value.
 pub fn total_units(cfg: &TimeConfig) -> u32 {
     units_of(cfg.total, cfg.unit, cfg.roundup)
 }
@@ -122,24 +105,20 @@ pub fn total_units(cfg: &TimeConfig) -> u32 {
 ///
 /// Two facts, both taken. One turn's ceiling is `remaining + byoyomi +
 /// increment`, and a configuration with none of the three never flags at all —
-/// `total = 0` with no byoyomi and no increment is an untimed server, not one
-/// that flags on move one.
+/// `total = 0` with no byoyomi and no increment is an untimed server.
 ///
-/// **The verdict is `charged >= allowance`**, not `>`. That is shogi-server's
-/// `<= 0`, and it is a deliberate divergence from a strict reading of the
-/// specification's "exceeds": with `Least_Time_Per_Move: 0`, truncation, and
-/// neither byoyomi nor increment, a player whose clock reached zero would
-/// otherwise play forever on sub-unit moves charged `0`, since `0 > 0` never
-/// holds. Boundary-exact consumption is the only observable difference, and the
-/// clients this is measured against are tuned to shogi-server.
+/// The verdict is `charged >= allowance`, not `>`, which is shogi-server's
+/// `<= 0` and a divergence from a strict reading of the specification's
+/// "exceeds": with `Least_Time_Per_Move: 0`, truncation, and neither byoyomi
+/// nor increment, a player whose clock reached zero would otherwise play
+/// forever on sub-unit moves charged `0`.
 ///
-/// **A function of `remaining`, not of a move.** The runtime wiring arms a
-/// deadline with this number *before* the side to move has sent anything, so
-/// `None` is that timer's answer too: a turn nothing interrupts.
+/// A function of `remaining`, not of a move: the runtime wiring arms a
+/// deadline with this number before the side to move has sent anything.
 ///
 /// Counted units rather than the configured [`Duration`]s, and `total_units`
 /// rather than `cfg.total`, because a sub-unit total is a clock that starts at
-/// zero — the case the guard exists for.
+/// zero.
 pub fn turn_allowance(remaining: u32, cfg: &TimeConfig) -> Option<u32> {
     let byoyomi = byoyomi_units(cfg);
     let increment = increment_units(cfg);
@@ -148,9 +127,7 @@ pub fn turn_allowance(remaining: u32, cfg: &TimeConfig) -> Option<u32> {
         return None;
     }
 
-    // Saturating: the sum of three configured counts and a remainder need not
-    // fit what the wire carries, and a wrapped ceiling would read as no time at
-    // all.
+    // Saturating: a wrapped ceiling would read as no time at all.
     Some(remaining.saturating_add(byoyomi).saturating_add(increment))
 }
 
@@ -163,27 +140,21 @@ pub fn turn_allowance(remaining: u32, cfg: &TimeConfig) -> Option<u32> {
 /// - `charged_units(flag_after(a, cfg), cfg) >= a`, and
 /// - any strictly shorter elapsed charges less than `a`.
 ///
-/// This is what the runtime wiring arms its deadline with, `a` being
-/// [`turn_allowance`] of what the side to move holds. The timer only *wakes*:
-/// the verdict at expiry is still `charged >= allowance` on a measured charge,
-/// which the property above makes hold by construction — so a deadline can
-/// never flag a turn the arrival path would have let through, however the two
-/// are reached.
+/// The timer only wakes: the verdict at expiry is still
+/// `charged >= allowance` on a measured charge, which the property above makes
+/// hold by construction, so a deadline can never flag a turn the arrival path
+/// would have let through.
 ///
-/// Concretely, `Time_Roundup: NO` truncates, so the charge first reaches `a` at
-/// `a × unit`; `YES` rounds up, so it first reaches `a` one resolution step past
-/// `(a − 1) × unit`. The step is a nanosecond, which is `units_of`'s own
-/// resolution.
+/// Concretely, `Time_Roundup: NO` truncates, so the charge first reaches `a`
+/// at `a × unit`; `YES` rounds up, so it first reaches `a` one nanosecond past
+/// `(a − 1) × unit`.
 ///
-/// **[`Duration::ZERO`] when the `Least_Time_Per_Move` floor alone reaches the
-/// allowance.** That is a turn which cannot be survived, and it is the correct
-/// reading rather than a degenerate one: every arrival is charged at least the
-/// floor, so any arrival flags too — the deadline and the arrival path agree, as
-/// they must. A zero allowance is one case of it, since a zero floor reaches it.
+/// [`Duration::ZERO`] when the `Least_Time_Per_Move` floor alone reaches the
+/// allowance: every arrival is charged at least the floor, so any arrival
+/// flags too.
 ///
-/// Saturating at [`Duration::MAX`] rather than overflowing, on `units_of`'s
-/// terms: `u32::MAX` minutes is not a real game, and a wrapped deadline would be
-/// one that has already passed.
+/// Saturating at [`Duration::MAX`] rather than overflowing, since a wrapped
+/// deadline would be one that has already passed.
 pub fn flag_after(allowance: u32, cfg: &TimeConfig) -> Duration {
     if units_of(cfg.least_time_per_move, cfg.unit, cfg.roundup) >= allowance {
         return Duration::ZERO;
@@ -205,15 +176,12 @@ pub fn flag_after(allowance: u32, cfg: &TimeConfig) -> Duration {
 
 /// `Increment` as a count of `Time_Unit`s: the credit a settlement adds.
 ///
-/// One number with two readings, which is why it is one function. It is what a
-/// setup move writes ([`setup_t_values`]), and it is what
-/// `Game`'s settlement credits — the reference credits and deducts in one
-/// operation (`TimeClock#process_time`), so the specification's "added before
-/// each turn begins" and that are indistinguishable in the arithmetic. Reading
-/// the two from one place is what makes a setup move's `T<increment>` cancel
-/// exactly rather than nearly.
+/// One number with two readings, which is why it is one function: it is what a
+/// setup move writes ([`setup_t_values`]) and what `Game`'s settlement
+/// credits, and reading the two from one place is what makes a setup move's
+/// `T<increment>` cancel exactly rather than nearly.
 ///
-/// Absent means zero: a game with no increment credits nothing.
+/// Absent means zero.
 pub fn increment_units(cfg: &TimeConfig) -> u32 {
     cfg.increment
         .map_or(0, |increment| units_of(increment, cfg.unit, cfg.roundup))
@@ -221,8 +189,8 @@ pub fn increment_units(cfg: &TimeConfig) -> u32 {
 
 /// `Byoyomi` as a count of `Time_Unit`s.
 ///
-/// Private, unlike [`increment_units`]: byoyomi is spent inside a turn and never
-/// added to a clock, so nothing outside [`turn_allowance`] has a use for it.
+/// Private, unlike [`increment_units`]: byoyomi is spent inside a turn and
+/// never added to a clock.
 fn byoyomi_units(cfg: &TimeConfig) -> u32 {
     cfg.byoyomi
         .map_or(0, |byoyomi| units_of(byoyomi, cfg.unit, cfg.roundup))
@@ -230,42 +198,32 @@ fn byoyomi_units(cfg: &TimeConfig) -> u32 {
 
 /// The T-value for each move of a setup sequence of `setup_len` plies.
 ///
-/// The project's settled convention:
+/// The T-value written is the time the server actually deducts, so under
+/// Fischer increment a `T<increment>` cancels against the increment and the
+/// two clocks agree. Asymmetric initial time rides the same channel, and the
+/// whole reduction lands on a single move: the reduced side's first opening
+/// move carries `T<reduction + increment>` and every other opening move
+/// carries `T<increment>`.
 ///
-/// > the T-value written is the time the server actually deducts, so under
-/// > Fischer increment a `T<increment>` cancels against the increment and the
-/// > two clocks agree. Asymmetric initial time is delivered through the same
-/// > channel: **the whole reduction lands on a single move** — the reduced
-/// > side's first opening move carries `T<reduction + increment>` and every
-/// > other opening move carries `T<increment>`. It is not spread across the
-/// > sequence.
+/// With no increment configured the values are `0`, which is the correct
+/// deduction for a move that consumed nothing.
 ///
-/// So every value is the increment, and one of them additionally carries the
-/// whole reduction. With no increment configured the values are `0`, which is
-/// the correct deduction for a move that consumed nothing.
+/// No `Least_Time_Per_Move` floor, unlike [`charged_units`]: a setup move
+/// consumed nothing, and flooring it would charge both players for moves they
+/// never made, with the error growing with the setup length.
 ///
-/// **No `Least_Time_Per_Move` floor**, unlike [`charged_units`]. A setup move
-/// consumed nothing, and this number is the deduction a client cancels against
-/// the increment; flooring it would charge both players for moves they never
-/// made, and the error would grow with the setup length — invariant 4's failure
-/// mode arriving through the fix for it.
-///
-/// **A length, not the moves.** Which move is the reduced side's first is a
-/// parity fact, not a search: a setup legal from hirate alternates strictly
-/// from Black, so Black's first move is index 0 and White's is index 1. Asking
-/// each move its color is not the alternative it looks like — a [`Move`]
+/// A length, not the moves. Which move is the reduced side's first is a parity
+/// fact: a setup legal from hirate alternates strictly from Black, so Black's
+/// first move is index 0 and White's is index 1. A [`Move`]
 /// carries no side, and cannot, because which side plays it is a property of
-/// the position it is applied to. `config::validate` decides the placement rule
-/// on exactly this reasoning.
+/// the position it is applied to.
 ///
 /// # Panics
 ///
-/// If a reduction is configured and the sequence is too short to contain a move
-/// by the reduced side. O-1 rejects every configuration that could reach it: a
-/// written board under a reduction, and a non-empty setup with no move by the
-/// reduced side. The remaining case — an entry that authored nothing — never
-/// arrives, because [`effective_setup`] substitutes [`KING_SHUTTLE`] before a
-/// length is taken from it.
+/// If a reduction is configured and the sequence is too short to contain a
+/// move by the reduced side. Startup validation rejects every configuration
+/// that could reach it, and an entry that authored nothing never arrives here
+/// because [`effective_setup`] substitutes [`KING_SHUTTLE`] first.
 pub fn setup_t_values(setup_len: usize, cfg: &TimeConfig) -> Vec<u32> {
     let increment = increment_units(cfg);
     let mut values = vec![increment; setup_len];
@@ -275,8 +233,8 @@ pub fn setup_t_values(setup_len: usize, cfg: &TimeConfig) -> Vec<u32> {
         let value = values
             .get_mut(first_move_index(reduction.side))
             .expect("validated at startup: reduced side moves in the setup");
-        // Saturating on `units_of`'s terms: both operands are configured
-        // counts, and their sum need not fit what the wire carries.
+        // Saturating: the sum of two configured counts need not fit what the
+        // wire carries.
         *value = increment.saturating_add(units_of(reduction.amount, cfg.unit, cfg.roundup));
     }
 
@@ -286,21 +244,14 @@ pub fn setup_t_values(setup_len: usize, cfg: &TimeConfig) -> Vec<u32> {
 /// The setup sequence actually transmitted, which is not always the one the
 /// operator authored.
 ///
-/// P-5's substitution rule, in the one place that decides it: an entry that
-/// authored no setup moves has no T-channel, so a game carrying a reduction
-/// transmits [`KING_SHUTTLE`] instead. Everything else transmits what the
-/// operator wrote. A written board substitutes nothing — O-1 already rejected a
-/// board under a reduction, so there is no reduction here to place, and the
-/// shuttle is legal from hirate only.
+/// An entry that authored no setup moves has no T-channel, so a game carrying
+/// a reduction transmits [`KING_SHUTTLE`] instead. A written board substitutes
+/// nothing: a board under a reduction is rejected at startup, and the shuttle
+/// is legal from hirate only.
 ///
-/// **Not an invariant 2 branch.** The question asked is whether the *authored
-/// sequence* is empty — whether there is a move to hang a T-value on — and not
-/// whether the position is hirate. Nothing here decodes, and a non-empty
-/// sequence that happens to return to hirate is passed through unchanged.
-///
-/// Reading this instead of restating the rule is what keeps the summary
-/// assembly (P-2) and the T-values below from disagreeing about how many moves
-/// are on the wire.
+/// Not a hirate branch. The question asked is whether the authored sequence is
+/// empty, not whether the position is hirate, so a non-empty sequence that
+/// happens to return to hirate is passed through unchanged.
 pub fn effective_setup<'a>(spec: &'a StartSpec, cfg: &TimeConfig) -> &'a [Move] {
     match spec {
         StartSpec::Buoy { setup } if setup.is_empty() && cfg.reduction.is_some() => &KING_SHUTTLE,
@@ -311,10 +262,9 @@ pub fn effective_setup<'a>(spec: &'a StartSpec, cfg: &TimeConfig) -> &'a [Move] 
 
 /// The index of `side`'s first move in a setup sequence legal from hirate.
 ///
-/// The parity `config::validate` establishes: such a sequence alternates
-/// strictly from Black, so Black moves first and White second. Whether the
-/// sequence is long enough to *have* that move is O-1's question, answered at
-/// startup.
+/// Such a sequence alternates strictly from Black, so Black moves first and
+/// White second. Whether the sequence is long enough to have that move is
+/// settled at startup.
 const fn first_move_index(side: Color) -> usize {
     match side {
         Color::Black => 0,
@@ -324,25 +274,23 @@ const fn first_move_index(side: Color) -> usize {
 
 /// A duration as a count of `unit`, under `Time_Roundup`.
 ///
-/// The specification (v1.2.1 §3): `Time_Roundup` — "`YES` rounds sub-unit time
-/// up, `NO` truncates". Truncation is the division; rounding up adds one when
-/// anything is left over.
+/// The specification (v1.2.1 section 3): `Time_Roundup` — "`YES` rounds
+/// sub-unit time up, `NO` truncates". Truncation is the division; rounding up
+/// adds one when anything is left over.
 ///
-/// **The only conversion in the crate**, so that a value written and the same
-/// value deducted cannot be counted two different ways. Both public functions
-/// above go through it.
+/// The only conversion in the crate, so that a value written and the same
+/// value deducted cannot be counted two different ways.
 ///
-/// Configured durations convert exactly whatever the flag says: `config`
-/// multiplied a written count by this same unit, so no remainder exists. The
-/// flag therefore matters only for a *measured* duration, which is the only
-/// input here that was not first an integer.
+/// Configured durations convert exactly whatever the flag says, since `config`
+/// multiplied a written count by this same unit. The flag therefore matters
+/// only for a measured duration.
 ///
 /// Nanoseconds rather than milliseconds, because a `1msec` game is precisely
 /// where a sub-unit remainder is visible and `Duration::as_millis` would have
 /// truncated it away before `roundup` could see it.
 ///
-/// Saturating at `u32::MAX`: the wire carries `u32`, and a measurement that
-/// large is not a real game — but a wrapped one would look like a free move.
+/// Saturating at `u32::MAX`, because a wrapped count would look like a free
+/// move.
 fn units_of(duration: Duration, unit: TimeUnit, roundup: bool) -> u32 {
     let nanos = duration.as_nanos();
     let per_unit = nanos_per_unit(unit);
@@ -359,9 +307,8 @@ fn units_of(duration: Duration, unit: TimeUnit, roundup: bool) -> u32 {
 
 /// A count of nanoseconds as a [`Duration`], saturating at [`Duration::MAX`].
 ///
-/// [`units_of`]'s counterpart, and saturating for the same reason: the input is
-/// a product of configured counts, and a wrapped one would name an instant in
-/// the past rather than a very distant one.
+/// Saturating because a wrapped duration would name an instant in the past
+/// rather than a very distant one.
 fn duration_of(nanos: u128) -> Duration {
     let Ok(seconds) = u64::try_from(nanos / NANOS_PER_SECOND) else {
         return Duration::MAX;
@@ -395,8 +342,7 @@ mod tests {
     use crate::game::Position;
 
     /// A symmetric configuration in the unit under test, with no increment, no
-    /// floor, and truncation — every test below turns on exactly the keys it is
-    /// about.
+    /// floor and truncation.
     fn config(unit: TimeUnit) -> TimeConfig {
         TimeConfig {
             unit,
@@ -409,8 +355,8 @@ mod tests {
         }
     }
 
-    /// The `[time]` table of the asymmetric worked example: `1sec`,
-    /// `Increment:2`, and 600 units off White's allowance.
+    /// An asymmetric `[time]` table: `1sec`, `Increment:2`, and 600 units off
+    /// White's allowance.
     fn asymmetric_example() -> TimeConfig {
         TimeConfig {
             increment: Some(Duration::from_secs(2)),
@@ -443,8 +389,8 @@ mod tests {
 
     #[test]
     fn an_exact_multiple_is_the_same_count_under_either_setting() {
-        // Every configured duration is one of these by construction, which is
-        // why the flag never affects a value that came out of the TOML.
+        // Every configured duration is an exact multiple, so the flag never
+        // affects a value that came out of the TOML.
         for unit in [TimeUnit::Second, TimeUnit::Minute, TimeUnit::Millisecond] {
             for count in [0, 1, 3, 600] {
                 let exact = unit.duration(count);
@@ -533,9 +479,9 @@ mod tests {
         // Total only: nothing extends a turn beyond what the clock holds.
         assert_eq!(turn_allowance(600, &base), Some(600));
 
-        // Byoyomi only, with the total exhausted — the specification's "when
-        // total time exhausted" is not a separate state here: it falls out of a
-        // remainder of zero.
+        // Byoyomi only, with the total exhausted: the specification's "when
+        // total time exhausted" falls out of a remainder of zero rather than
+        // being a state of its own.
         let byoyomi = TimeConfig {
             total: Duration::ZERO,
             byoyomi: Some(Duration::from_secs(30)),
@@ -553,7 +499,7 @@ mod tests {
         assert_eq!(turn_allowance(0, &increment), Some(2));
 
         // All three, which the specification never combines and shogi-server
-        // adds: remaining + byoyomi + increment.
+        // adds.
         let all = TimeConfig {
             byoyomi: Some(Duration::from_secs(30)),
             increment: Some(Duration::from_secs(2)),
@@ -621,8 +567,8 @@ mod tests {
 
     #[test]
     fn consuming_the_allowance_exactly_is_a_flag_and_one_unit_less_is_not() {
-        // The deliberate divergence from a strict reading of "exceeds": the
-        // verdict is `charged >= allowance`, shogi-server's `<= 0`.
+        // The divergence from a strict reading of "exceeds": the verdict is
+        // `charged >= allowance`, shogi-server's `<= 0`.
         let cfg = TimeConfig {
             byoyomi: Some(Duration::from_secs(30)),
             ..config(TimeUnit::Second)
@@ -641,9 +587,9 @@ mod tests {
         assert!(flags(0, 0, &exhausted));
     }
 
-    /// The verdict as every caller applies it, written once: `charged` against
-    /// what a side holding `remaining` may spend, and never a flag where there
-    /// is no allowance at all.
+    /// The verdict as every caller applies it: `charged` against what a side
+    /// holding `remaining` may spend, and never a flag where there is no
+    /// allowance at all.
     fn flags(charged: u32, remaining: u32, cfg: &TimeConfig) -> bool {
         turn_allowance(remaining, cfg).is_some_and(|allowance| charged >= allowance)
     }
@@ -656,8 +602,7 @@ mod tests {
     /// one step before it.
     ///
     /// Asserted against [`charged_units`] rather than against the formula that
-    /// produced the instant: an inverse checked against its own arithmetic
-    /// verifies nothing.
+    /// produced the instant.
     fn pins_the_flag(allowance: u32, cfg: &TimeConfig) {
         let at = flag_after(allowance, cfg);
 
@@ -680,8 +625,7 @@ mod tests {
 
     #[test]
     fn the_flag_falls_at_the_earliest_elapsed_whose_charge_reaches_the_allowance() {
-        // Both `Time_Roundup` settings, all three units, with and without a
-        // floor — the four inputs the conversion reads.
+        // The four inputs the conversion reads.
         for unit in [TimeUnit::Second, TimeUnit::Minute, TimeUnit::Millisecond] {
             for roundup in [false, true] {
                 for floor in [0, 1, 3] {
@@ -701,8 +645,7 @@ mod tests {
 
     #[test]
     fn truncation_flags_at_the_allowance_and_rounding_up_just_past_one_unit_less() {
-        // The two formulas the property comes out as, written once so that a
-        // change of shape has to be deliberate.
+        // The two formulas the property comes out as.
         for unit in [TimeUnit::Second, TimeUnit::Minute, TimeUnit::Millisecond] {
             let truncating = config(unit);
             assert_eq!(flag_after(600, &truncating), unit.duration(600), "{unit:?}");
@@ -757,10 +700,7 @@ mod tests {
 
     #[test]
     fn an_unreal_deadline_saturates_rather_than_wrapping() {
-        // A wrapped instant would name a deadline in the past. The largest
-        // configuration reachable through `flag_after` is far below the ceiling
-        // — `u32::MAX` minutes is some 8,000 years — so the saturation is
-        // asserted where it can be reached at all.
+        // A wrapped instant would name a deadline in the past.
         assert_eq!(duration_of(u128::MAX), Duration::MAX);
         assert_eq!(
             duration_of(u128::from(u64::MAX) * NANOS_PER_SECOND + NANOS_PER_SECOND),
@@ -774,9 +714,8 @@ mod tests {
 
     #[test]
     fn the_increment_credited_is_the_value_a_setup_move_writes() {
-        // The cancellation checked against the writer rather than against
-        // itself: a setup move deducts what settlement credits, so the two
-        // annul exactly.
+        // A setup move deducts what settlement credits, so the two annul
+        // exactly.
         let cfg = TimeConfig {
             increment: Some(Duration::from_secs(2)),
             ..config(TimeUnit::Second)
@@ -830,17 +769,16 @@ mod tests {
                 ..config(TimeUnit::Second)
             };
 
-            // Never spread: one move carries all of it, and it is the first the
-            // reduced side plays — index 0 for Black, index 1 for White.
+            // Never spread: the first move the reduced side plays carries all
+            // of it — index 0 for Black, index 1 for White.
             assert_eq!(setup_t_values(4, &cfg), expected, "{side:?}");
         }
     }
 
     #[test]
     fn the_example_configuration_produces_the_t602_shape() {
-        // The asymmetric worked example's `[time]` table over the four-ply
-        // king shuttle: the wire
-        // reads `+5958OU,T2 -5152OU,T602 +5859OU,T2 -5251OU,T2`.
+        // The asymmetric `[time]` table over the four-ply king shuttle: the
+        // wire reads `+5958OU,T2 -5152OU,T602 +5859OU,T2 -5251OU,T2`.
         let values = setup_t_values(KING_SHUTTLE.len(), &asymmetric_example());
 
         assert_eq!(values, vec![2, 602, 2, 2]);
@@ -895,8 +833,7 @@ mod tests {
 
     #[test]
     fn the_king_shuttle_is_the_four_moves_of_the_documented_sequence() {
-        // `+5958OU -5152OU +5859OU -5251OU`, square by square. The CSA
-        // spelling itself stops at the codec (invariant 3).
+        // `+5958OU -5152OU +5859OU -5251OU`, square by square.
         let expected = [
             ((5, 9), (5, 8)),
             ((5, 1), (5, 2)),
@@ -922,8 +859,8 @@ mod tests {
 
     #[test]
     fn the_king_shuttle_returns_exactly_to_hirate() {
-        // "Returning exactly to hirate" as an executable fact: board, hands,
-        // and side to move at once, since `Position` compares on those three.
+        // Board, hands and side to move at once, since `Position` compares on
+        // those three.
         let decoded = buoy(&KING_SHUTTLE)
             .decode()
             .expect("the shuttle is legal from hirate");
@@ -944,8 +881,8 @@ mod tests {
 
     #[test]
     fn an_authored_sequence_is_transmitted_as_written_either_way() {
-        // Two plies, so White moves in it: what O-1 requires of an entry under
-        // a reduction. Nothing substitutes for a sequence that exists.
+        // Two plies, so White moves in it. Nothing substitutes for a sequence
+        // that exists.
         let authored = vec![step(7, 7, 7, 6), step(3, 3, 3, 4)];
         let spec = buoy(&authored);
 
@@ -961,8 +898,8 @@ mod tests {
 
     #[test]
     fn a_written_board_substitutes_nothing() {
-        // O-1 rejected a board under a reduction, so there is no reduction here
-        // to place — and the shuttle is legal from hirate only.
+        // A board under a reduction is rejected at startup, and the shuttle is
+        // legal from hirate only.
         let spec = StartSpec::Board(Position::hirate());
 
         assert!(effective_setup(&spec, &asymmetric_example()).is_empty());
@@ -971,8 +908,8 @@ mod tests {
 
     #[test]
     fn a_sequence_returning_to_its_start_is_not_treated_as_empty() {
-        // Invariant 2: the question is whether the operator authored a move to
-        // hang a T-value on, not whether the position is hirate.
+        // No hirate branch: the question is whether the operator authored a move
+        // to hang a T-value on, not whether the position is hirate.
         let spec = buoy(&KING_SHUTTLE);
 
         assert_eq!(

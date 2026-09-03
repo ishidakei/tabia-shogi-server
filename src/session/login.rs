@@ -1,37 +1,15 @@
 //! The login decision: verification by mode, and the duplicate-login rule.
 //!
-//! This module owns `LOGIN` and calls `auth::token::verify`, inside this
-//! division of labor: `session/login.rs` hashes the presented token, asks
-//! `storage` for the row, and verifies. `web` generates and hands the hash to
-//! `storage`. The fetch is the caller's; the cryptography is `auth`'s.
+//! What is here is the decision, a pure function of four values. Reading the
+//! line, fetching the row, killing the old session and entering `Waiting`
+//! belong to the connection task.
 //!
-//! What is here is the *decision* — a pure function of four values, like
-//! [`clock`](super::clock)'s arithmetic. Reading the line, fetching the row,
-//! killing the old session, and entering `Waiting` belong to the connection
-//! task, which arrives with its own slice. Three rules meet at a `LOGIN`, each
-//! from a different document — whether the credential is good, whether an
-//! existing session may be displaced, and whether that displacement kills
-//! anything — and written inline next to a socket read and a database call they
-//! would be testable only through a live connection.
-//!
-//! **The identity a token logs in as is its hash**, `auth::token::hash(token)`,
-//! in both modes. Rating attaches to the token rather than to the account or
-//! the engine name (P-1) and token identity is
-//! byte-for-byte (Q5), so `open` mode's "synthetic participant identity derived
-//! from it" is the crate's one hashing implementation and not a second
-//! derivation beside it. The same value is both keys the handler needs: the
-//! storage lookup, and the pool lookup that answers [`ExistingSession`]. In
-//! particular the duplicate rule below is keyed by that identity and **not** by
-//! the engine name — P-1's criterion reads "a token whose session …", and
-//! nothing in the documents makes two engines sharing a name a collision.
-//!
-//! Everything the decision needs already exists around it: the codec bounds the
-//! line and its charsets before a [`Command::Login`] exists, [`Response`]
-//! renders both answers, [`auth`](crate::auth) hashes and compares, and
-//! [`AuthMode`] carries the two modes.
-//!
-//! [`Command::Login`]: crate::csa::Command::Login
-//! [`Response`]: crate::csa::Response
+//! The identity a token logs in as is its hash, in both modes: rating attaches
+//! to the token rather than to the account or the engine name, and token
+//! identity is byte for byte. The same value is both keys the handler needs —
+//! the storage lookup, and the pool lookup that answers [`ExistingSession`].
+//! In particular the duplicate rule below is keyed by that identity and not by
+//! the engine name, so two engines sharing a name are not a collision.
 
 use std::time::Duration;
 
@@ -51,30 +29,23 @@ use crate::config::AuthMode;
 /// ```
 ///
 /// Two details of that line are load-bearing and are kept exactly. The
-/// comparison is **strictly greater**, so a session idle for precisely this
-/// long is not yet takeable. And "idle" is measured from the *last received
-/// command* — `last_command_at`, not the game's start and not the last move —
-/// which is the handler's measurement to make; nothing here asks what time it
-/// is.
+/// comparison is strictly greater, so a session idle for precisely this long
+/// is not yet takeable; and idle is measured from the last received command —
+/// `last_command_at`, not the game's start and not the last move.
 ///
-/// P-1 keeps the escape hatch for the reason shogi-server has it: without it a
-/// session wedged mid-game locks its token out permanently, and a token is the
-/// only credential its owner has.
+/// Without the escape hatch a session wedged mid-game would lock its token out
+/// permanently, and a token is the only credential its owner has.
 pub const IDLE_TAKEOVER: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// What is known about a session already logged in under the same token.
 ///
-/// Only what the rule reads. A session's state machine has more in it than
-/// this, and none of the rest changes the answer.
+/// Only what the rule reads. The idle time rides on
+/// [`InGame`](ExistingSession::InGame) because it is read in exactly one
+/// branch: a session that is not in a game is displaced however long it has
+/// been quiet.
 ///
-/// The idle time rides on [`InGame`](ExistingSession::InGame) rather than
-/// sitting beside it because it is read in exactly one branch: a session that
-/// is not in a game is displaced however long it has been quiet. Attaching the
-/// duration to both variants would create a value with no meaning in one of
-/// them.
-///
-/// "No session holds this token" is `Option::None` around this type rather than
-/// a third variant — the absence of a session is not a state a session is in.
+/// No session holding this token is `Option::None` around this type rather
+/// than a third variant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExistingSession {
     /// Logged in, but not playing: waiting, or between games.
@@ -88,14 +59,12 @@ pub enum ExistingSession {
 /// The answer to a `LOGIN`, including the side effect it owes.
 ///
 /// `kill_old` is a field of [`Accept`](LoginDecision::Accept) rather than a
-/// third variant, because the kill is not a third outcome — it is a fact about
-/// an acceptance. A [`Reject`](LoginDecision::Reject) cannot carry one, so
-/// "a failed login never kills a session" is a property of this type and not a
-/// rule the handler has to remember.
+/// third variant, so a failed login never killing a session is a property of
+/// this type rather than a rule the handler has to remember.
 ///
 /// `Reject` carries no reason, deliberately. The wire has exactly one
-/// rejection, `LOGIN:incorrect`, and P-1 gives an unknown token, a revoked
-/// token, and a protected in-game session the same answer. A reason here would
+/// rejection, `LOGIN:incorrect`, and an unknown token, a revoked token, and a
+/// protected in-game session all get it. A reason here would
 /// be a distinction the protocol cannot carry, and offering it to the handler is
 /// how a probe eventually learns which tokens exist.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,37 +83,24 @@ pub enum LoginDecision {
 /// `existing` is what the caller found in the pool at the same identity. Both
 /// are the handler's to obtain; this function decides what they mean.
 ///
-/// **The ordering is the security property.** An invalid credential is
+/// The ordering is the security property. An invalid credential is
 /// [`Reject`](LoginDecision::Reject) whatever session exists, because
-/// shogi-server kills the old player only *inside* the branch where the password
-/// already matched. A failed login that could reach the duplicate rule would let
-/// anyone with a guess at a token disconnect its owner, which is a denial of
-/// service that needs no credential at all.
+/// shogi-server kills the old player only inside the branch where the password
+/// already matched, and a failed login that could reach the duplicate rule
+/// would let anyone with a guess at a token disconnect its owner.
 ///
-/// What "valid" means is the mode's:
+/// What valid means is the mode's: under `github` the token is looked up by
+/// hash, and under `open` any token string is accepted and a synthetic
+/// participant identity is derived from it. So `stored = None` is a rejection
+/// under `github` and is not consulted at all under `open`.
 ///
-/// > - `github` mode: the token is looked up by hash. Unknown or revoked tokens
-/// >   produce `LOGIN:incorrect`.
-/// > - `open` mode: any token string is accepted and a synthetic participant
-/// >   identity is derived from it.
-///
-/// so `stored = None` is a rejection under `github` — unknown and revoked look
-/// the same to the fetch, and P-1 gives both the same answer — and is not
-/// consulted at all under `open`.
-///
-/// The duplicate rule is P-1's, following shogi-server:
-///
-/// > the new login is accepted and the old session killed when the token is
-/// > valid and the old session is not in a game; a session in a game is
-/// > protected and the new login is rejected. Since a token is a credential
-/// > rather than a name, the "password matches" half of shogi-server's
-/// > condition is implied by the token verifying at all. The idle-over-a-day
-/// > escape hatch is retained so a wedged session cannot lock a token out
-/// > permanently.
+/// The duplicate rule follows shogi-server: the new login is accepted and the
+/// old session killed when the token is valid and the old session is not in a
+/// game, while a session in a game is protected. The idle-over-a-day escape
+/// hatch is retained so a wedged session cannot lock a token out permanently.
 ///
 /// A session that disconnects leaves the pool immediately, so reconnecting
-/// after a dropped connection never reaches this rule — it governs genuine
-/// concurrency, not recovery.
+/// after a dropped connection never reaches this rule.
 pub fn decide(
     mode: AuthMode,
     presented: &str,
@@ -158,8 +114,7 @@ pub fn decide(
     match existing {
         None => LoginDecision::Accept { kill_old: false },
         Some(ExistingSession::NotInGame) => LoginDecision::Accept { kill_old: true },
-        // Strictly greater, as shogi-server's `> ONE_DAY` reads: a session idle
-        // for exactly the threshold is not yet takeable.
+        // Strictly greater, as shogi-server's `> ONE_DAY` reads.
         Some(ExistingSession::InGame { idle }) if idle > IDLE_TAKEOVER => {
             LoginDecision::Accept { kill_old: true }
         }
@@ -169,20 +124,13 @@ pub fn decide(
 
 /// Whether the presented token is a credential this instance accepts.
 ///
-/// The [`verify`](token::verify) call stays under `github` even though a caller
-/// that fetched by `token::hash(presented)` can only have obtained a matching
-/// row. Hash → fetch → verify is this module's contract, and this function
-/// cannot see how the caller fetched: a
-/// later handler that looks the row up by name, or a storage layer that returns
-/// a near match, is exactly the shape the check catches. The cost is one
-/// SHA-256 on a path that is hot only when many engines reconnect at once,
-/// which is the same trade this server already made in choosing a plain digest
-/// over a password hash.
+/// The [`verify`](token::verify) call stays under `github` even though a
+/// caller that fetched by `token::hash(presented)` can only have obtained a
+/// matching row: this function cannot see how the caller fetched, and a later
+/// handler that looks the row up by name is the shape the check catches.
 ///
-/// `open` mode does not read `stored`. Q5's syntactic bounds — printable ASCII
-/// excluding space, 1–64 characters — were enforced by the codec before a
-/// `Command::Login` existed, so there is nothing left to check here and a second
-/// opinion would be one this module has no way to report.
+/// `open` mode does not read `stored`. The syntactic bounds were enforced by
+/// the codec before a `Command::Login` existed.
 fn credential_is_valid(mode: AuthMode, presented: &str, stored: Option<&TokenHash>) -> bool {
     match mode {
         AuthMode::Github => stored.is_some_and(|stored| token::verify(presented, stored)),
@@ -228,8 +176,7 @@ mod tests {
 
     #[test]
     fn github_rejects_an_unknown_or_revoked_token() {
-        // The fetch found no row. P-1 gives "unknown" and "revoked" the same
-        // answer, and they are the same input here.
+        // The fetch found no row: unknown and revoked are the same input here.
         assert_eq!(
             decide(AuthMode::Github, TOKEN, None, None),
             LoginDecision::Reject
@@ -254,8 +201,7 @@ mod tests {
     #[test]
     fn open_never_consults_the_stored_hash() {
         // A mismatching row would reject under `github`; under `open` the
-        // argument is not read at all, which is what distinguishes "not needed"
-        // from "not consulted".
+        // argument is not read at all.
         let mismatched = token::hash(OTHER);
 
         assert_eq!(
@@ -266,9 +212,9 @@ mod tests {
 
     #[test]
     fn open_accepts_any_token_string() {
-        // Q5's charset and length were the codec's; anything reaching here is
+        // The charset and length are the codec's; anything reaching here is
         // already inside them.
-        for presented in ["a", "test-engine_01", OTHER, TOKEN] {
+        for presented in ["a", "preset-engine_01", OTHER, TOKEN] {
             assert_eq!(
                 decide(AuthMode::Open, presented, None, None),
                 accept_no_kill(),
@@ -366,8 +312,8 @@ mod tests {
 
     #[test]
     fn an_invalid_credential_never_kills_a_session() {
-        // The whole rule, not only the case P-1's criteria name: no shape of
-        // `existing` turns a failed login into a kill, because the credential
+        // The whole rule, over every shape of `existing`: none of them turns a
+        // failed login into a kill, because the credential
         // check returns before `existing` is read.
         let mismatched = token::hash(OTHER);
 

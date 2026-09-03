@@ -1,0 +1,10 @@
+{% extends "layout.html" %}
+
+{% block title %}サインインが必要です — tabia-shogi-server{% endblock %}
+
+{% block content %}
+<h2>サインインが必要です</h2>
+<p><a href="/sign-in">GitHub でサインインする</a></p>
+<p class="muted">サーバーが GitHub から取得して保存するのは、ユーザー ID・アカウント名・アバター画像の URL の 3 つだけです。</p>
+<p><a href="/">対局一覧</a></p>
+{% endblock %}

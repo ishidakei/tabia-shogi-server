@@ -1,0 +1,27 @@
+{% extends "layout.html" %}
+
+{% block title %}発行できません — tabia-shogi-server{% endblock %}
+
+{% block content %}
+<h2>発行できません</h2>
+
+{% match refusal %}
+{% when Refusal::AtActiveCap with { cap } %}
+<p>アクティブなトークンが上限の {{ cap }} 個に達しています。</p>
+<p>どれか 1 つを失効させるとアクティブの枠が 1 つ空き、次の発行ができます。</p>
+{% when Refusal::AtLifetimeCap with { cap } %}
+<p>これまでに発行したトークンが上限の {{ cap }} 個に達しています。失効させたものも数に入ります。</p>
+<p>失効させても発行累計の枠は空きません。上限の変更は運用者の設定 (<code>[accounts]</code> の <code>lifetime_token_cap</code>) です。</p>
+{% when Refusal::RatingNotOffered %}
+<p>仮のレーティングを付けられるのは、そのアカウントがレーティングの付いたエンジンを 1 つ以上持っている場合だけです (トークンが異なれば別エンジンとして扱います)。</p>
+<p>いまはまだ 1 つもないので、仮のレーティングなしで発行してください。</p>
+{% when Refusal::RatingAboveBound with { bound, asked } %}
+<p>仮のレーティング {{ asked }} は上限の {{ bound }} を超えています。上限は、そのアカウントのレーティングの付いたエンジンのうち最も高い値です。</p>
+<p>{{ bound }} 以下の値を入れるか、空のまま発行してください。</p>
+{% when Refusal::RatingNotANumber with { written } %}
+<p>仮のレーティングは整数で書きます。<code>{{ written }}</code> は整数ではありません。</p>
+<p>空のままにすると、仮のレーティングなしで発行します。</p>
+{% endmatch %}
+
+<p><a href="/tokens">トークン一覧へ</a></p>
+{% endblock %}

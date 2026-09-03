@@ -1,37 +1,28 @@
-//! Line framing: bounded reads and terminated writes.
-//!
-//! A CSA session is a sequence of lines, so framing is where the "bound it
-//! before allocating on it" rule becomes code.
-//! Nothing here interprets a line; that is the command layer's job.
+//! Line framing: bounded reads and terminated writes. Nothing here interprets
+//! a line; that is the command layer's job.
 
 use std::io;
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Longest `LOGIN` line the protocol can legitimately carry, in bytes:
-/// `"LOGIN "` (6) + an engine name of up to 1024 + `" "` (1) + a token of up
-/// to 64 = 1095.
-///
-/// Both fields are counted in characters by the PRD, and a character is a byte
-/// for both: engine names are `[A-Za-z0-9_@\-\.]` (Q4) and `open`-mode tokens
-/// are printable ASCII (Q5).
+/// Longest `LOGIN` line the protocol can legitimately carry, in bytes. Both
+/// fields are counted in characters, and a character is a byte for both:
+/// engine names are `[A-Za-z0-9_@\-\.]` and `open`-mode tokens are printable
+/// ASCII.
 const MAX_LOGIN_LINE_LEN: usize = "LOGIN ".len() + 1024 + " ".len() + 64;
 
 /// Maximum length of one CSA line, terminator excluded.
 ///
-/// `MAX_LOGIN_LINE_LEN` above 1 KB is why this is not the round 1024 a reader
-/// would expect: that cap would reject a login carrying a maximal engine name.
-/// This is that arithmetic rounded up to the
-/// next power of two, so the bound holds even if `LOGIN` stops being the
-/// longest client line.
+/// Not the round 1024 a reader would expect: a maximal `LOGIN` line runs past
+/// 1 KB, so that cap would reject a login the protocol allows.
 pub const MAX_LINE_LEN: usize = 2048;
 
 const _: () = assert!(MAX_LINE_LEN >= MAX_LOGIN_LINE_LEN);
 
 /// Bytes read for one line before the reader gives up: a maximal line plus the
 /// longest terminator it may carry (CR LF). Reading one byte past a full line
-/// is what distinguishes "exactly at the cap" from "over it" without ever
-/// holding an over-long line.
+/// distinguishes "exactly at the cap" from "over it" without ever holding an
+/// over-long line.
 const READ_LIMIT: usize = MAX_LINE_LEN + 2;
 
 /// A framing failure. Every variant is fatal to the connection that produced
@@ -58,15 +49,15 @@ pub enum Error {
 /// and the returned line carries neither byte. No specification text governs
 /// the terminator; this follows shogi-server, which reads LF-delimited lines
 /// and strips the trailing CR/LF cluster (`gets_safe` and the read loop in its
-/// main server script) — **shogi-server-compatible**.
+/// main server script).
 pub struct LineReader<R> {
     inner: R,
     buf: Vec<u8>,
 }
 
 /// Hand-written because `buf` transiently holds a whole `LOGIN` line — engine
-/// name and token — and a derived `Debug` would print it (invariant 8: no
-/// credential material in a rendering). Only the buffered length is shown.
+/// name and token — and a derived `Debug` would print it. No credential
+/// material in a rendering.
 impl<R> std::fmt::Debug for LineReader<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LineReader")
@@ -89,8 +80,8 @@ impl<R: AsyncBufRead + Unpin> LineReader<R> {
     /// Returns `Ok(None)` when the stream ends cleanly on a line boundary.
     ///
     /// At most [`READ_LIMIT`] bytes are read per call, so a client that never
-    /// sends a terminator is refused after a bounded read rather than growing
-    /// a buffer until it decides to stop.
+    /// sends a terminator is refused rather than growing a buffer until it
+    /// decides to stop.
     pub async fn read_line(&mut self) -> Result<Option<&str>, Error> {
         self.buf.clear();
         let read = (&mut self.inner)
@@ -130,17 +121,15 @@ impl<R: AsyncBufRead + Unpin> LineReader<R> {
 
 /// Writes CSA lines, each terminated with LF.
 ///
-/// Flushing is deliberately not offered: when a line reaches the wire is a
-/// relay decision, so callers reach the stream through [`LineWriter::get_mut`]
-/// and flush it themselves.
+/// Flushing is not offered: when a line reaches the wire is a relay decision,
+/// so callers reach the stream through [`LineWriter::get_mut`] and flush it
+/// themselves.
 pub struct LineWriter<W> {
     inner: W,
     buf: Vec<u8>,
 }
 
-/// Hand-written for the same reason as [`LineReader`]'s: `buf` holds outgoing
-/// line content, so only its length is shown (invariant 8: no credential
-/// material in a rendering).
+/// Hand-written for the same reason as [`LineReader`]'s.
 impl<W> std::fmt::Debug for LineWriter<W> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LineWriter")
@@ -160,9 +149,8 @@ impl<W: AsyncWrite + Unpin> LineWriter<W> {
 
     /// Writes `line` followed by LF, and nothing else.
     ///
-    /// `line` is expected to carry no terminator of its own; the codec adds
-    /// the only one. Assembling line and terminator before the write keeps
-    /// them in one call, so a line cannot reach the wire unterminated.
+    /// `line` must carry no terminator of its own; the codec adds the only
+    /// one, in the same write, so a line cannot reach the wire unterminated.
     pub async fn write_line(&mut self, line: &str) -> Result<(), Error> {
         debug_assert!(
             !line.contains('\n'),
@@ -205,7 +193,7 @@ mod tests {
     }
 
     /// Serves `b'a'` up to `remaining` bytes and counts what a reader consumed,
-    /// so an unbounded reader fails the test instead of hanging it.
+    /// so an unbounded reader fails a test instead of hanging it.
     struct Endless {
         chunk: [u8; 64],
         remaining: usize,
@@ -253,6 +241,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn reads_an_lf_terminated_line() {
         assert_eq!(
@@ -261,6 +250,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn reads_a_crlf_terminated_line_without_either_terminator() {
         assert_eq!(
@@ -269,6 +259,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn strips_only_the_cr_that_precedes_the_lf() {
         // A CR anywhere else is content, not framing.
@@ -278,11 +269,13 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn reads_an_empty_line() {
         assert_eq!(read_one(b"\n").await.unwrap().as_deref(), Some(""));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn reads_successive_lines_then_reports_end_of_stream() {
         let input = b"+7776FU,T10\n-3334FU,T12\n";
@@ -293,11 +286,13 @@ mod tests {
         assert_eq!(reader.read_line().await.unwrap(), None);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn reports_end_of_stream_on_an_empty_stream() {
         assert_eq!(read_one(b"").await.unwrap(), None);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn accepts_a_line_of_exactly_the_cap() {
         let mut input = vec![b'a'; MAX_LINE_LEN];
@@ -307,6 +302,7 @@ mod tests {
         assert_eq!(line.len(), MAX_LINE_LEN);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn accepts_a_line_of_exactly_the_cap_with_crlf() {
         let mut input = vec![b'a'; MAX_LINE_LEN];
@@ -316,6 +312,7 @@ mod tests {
         assert_eq!(line.len(), MAX_LINE_LEN);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn rejects_a_line_one_byte_over_the_cap() {
         let mut input = vec![b'a'; MAX_LINE_LEN + 1];
@@ -324,9 +321,9 @@ mod tests {
         assert!(matches!(read_one(&input).await, Err(Error::LineTooLong)));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn accepts_a_maximal_login_line() {
-        // Regression against a cap of a round 1024, which this line exceeds.
         let name = "a".repeat(1024);
         let token = "b".repeat(64);
         let input = format!("LOGIN {name} {token}\n");
@@ -336,6 +333,7 @@ mod tests {
         assert_eq!(line.len(), MAX_LOGIN_LINE_LEN);
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn refuses_a_terminator_free_stream_after_a_bounded_read() {
         let mut reader = LineReader::new(Endless::new(1 << 20));
@@ -349,6 +347,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn rejects_invalid_utf8() {
         assert!(matches!(
@@ -357,6 +356,7 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn accepts_multi_byte_utf8() {
         assert_eq!(
@@ -365,6 +365,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn rejects_a_line_truncated_by_end_of_stream() {
         assert!(matches!(
@@ -373,6 +374,7 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn debug_omits_the_line_just_read() {
         let mut reader = LineReader::new(&b"LOGIN engine-1 s3cret-token\n"[..]);
@@ -386,6 +388,7 @@ mod tests {
         assert!(!debug.contains("s3cret-token"), "Debug leaked a token");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn writes_a_line_followed_by_lf() {
         let mut writer = LineWriter::new(Vec::new());
@@ -395,6 +398,7 @@ mod tests {
         assert_eq!(writer.into_inner(), b"LOGIN:test OK\n");
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn writes_successive_lines_with_nothing_between_them() {
         let mut writer = LineWriter::new(Vec::new());
@@ -409,6 +413,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore)]
     #[tokio::test]
     async fn round_trips_a_written_line_through_the_reader() {
         let mut writer = LineWriter::new(Vec::new());

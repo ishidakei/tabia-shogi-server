@@ -1,29 +1,22 @@
 //! RFC 3339 timestamps, for the one configured value that is a wall-clock time.
 //!
-//! `[matchmaking].first_round_at` names an absolute moment — "the first round
-//! after startup runs at 09:00 Japan time" — and every other duration in the
-//! configuration is a count of seconds from something. A count cannot express
-//! it, so this module reads the one format an operator can write such a moment
-//! in without ambiguity.
+//! `[matchmaking].first_round_at` names an absolute moment, where every other
+//! duration in the configuration is a count of seconds from something.
 //!
-//! **The offset is required**, which is what RFC 3339 asks for and what makes
-//! the value mean the same thing on a server whose timezone nobody stated:
+//! The offset is required, which is what RFC 3339 asks for and what makes the
+//! value mean the same thing on a server whose timezone nobody stated:
 //!
 //! > date-time = full-date "T" full-time
 //! > full-time = partial-time time-offset
 //! > time-offset = "Z" / time-numoffset
 //!
-//! **No date crate.** Every dependency here is carried for a stated reason, and
-//! one timestamp key is not a reason: what is needed
-//! is one parse of one grammar into a [`SystemTime`], and that is Howard
-//! Hinnant's `days_from_civil` plus a fixed-width scan — the same argument
-//! `session::server`'s `civil_from_days` records for the other direction.
+//! No date crate: what is needed is one parse of one grammar into a
+//! [`SystemTime`], and that is Howard Hinnant's `days_from_civil` plus a
+//! fixed-width scan.
 //!
-//! **Sub-second precision is read and discarded.** A fraction is accepted
-//! because RFC 3339 has one, and truncated because what this value schedules is
-//! a matchmaking round: the difference between 09:00:00.9 and 09:00:00 is not a
-//! difference an engine developer can observe, and carrying it would put a
-//! precision in the type that nothing downstream keeps.
+//! Sub-second precision is read and discarded. A fraction is accepted because
+//! RFC 3339 has one, and truncated because what this value schedules is a
+//! matchmaking round.
 
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -54,11 +47,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub fn parse(text: &str) -> Result<SystemTime, TimestampError> {
     let bytes = text.as_bytes();
 
-    // Fixed widths up to the seconds, so a shape that is nearly right — a
-    // one-digit hour, a missing separator — is refused as a shape rather than
-    // parsed into a number that happens to fit. ASCII first, because every
-    // index below is a byte index and a multi-byte character would otherwise
-    // decide between a refusal and a panic.
+    // Fixed widths up to the seconds, so a shape that is nearly right is
+    // refused as a shape rather than parsed into a number that happens to fit.
+    // ASCII first, because every index below is a byte index.
     if !text.is_ascii() || bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' {
         return Err(TimestampError::Shape);
     }
@@ -95,9 +86,7 @@ pub fn parse(text: &str) -> Result<SystemTime, TimestampError> {
 ///
 /// `Z` and `+00:00` are the same number, and both are written in practice.
 fn offset(text: &str) -> Result<i64, TimestampError> {
-    // The optional fraction, discarded once its digits are known to be digits:
-    // `2026-11-14T00:00:00.5+09:00` differs from the same timestamp without the
-    // fraction by half a second, and a round is not scheduled to a half second.
+    // The optional fraction, discarded once its digits are known to be digits.
     let text = match text.strip_prefix('.') {
         None => text,
         Some(fraction) => {
@@ -182,13 +171,7 @@ const fn days_in_month(year: u32, month: u32) -> u32 {
 /// The number of days from 1970-01-01 to the given civil date.
 ///
 /// Howard Hinnant's `days_from_civil`, the inverse of the `civil_from_days` in
-/// [`session::server`], written out for the same reason: the whole of what this
-/// server needs a calendar for is one date each way.
-///
-/// Total for every value the checks above let through, and for every value they
-/// do not — the algorithm has no failure mode.
-///
-/// [`session::server`]: crate::session::server
+/// [`stamp`](crate::stamp). Total: the algorithm has no failure mode.
 const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     // Shift the epoch to 0000-03-01, so that a leap day is the last day of a
     // year rather than a hole in the middle of one.
@@ -233,10 +216,9 @@ pub enum TimestampError {
 /// The moment `[matchmaking].first_round_at` names, and the text it was written
 /// as.
 ///
-/// Both, because both are read: the schedule needs the instant, and the startup
-/// log line quotes the operator's own string back at them — an offset resolved
-/// into some other spelling of the same moment is a line whose reader has to do
-/// arithmetic to check their file against it.
+/// Both, because both are read: the schedule needs the instant, and the
+/// startup log line quotes the operator's own string back at them rather than
+/// some other spelling of the same moment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FirstRound {
     at: SystemTime,

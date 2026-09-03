@@ -1,0 +1,62 @@
+{% extends "layout.html" %}
+
+{% block title %}アカウント — tabia-shogi-server{% endblock %}
+
+{% block content %}
+<h2>アカウント</h2>
+
+<p class="muted">
+GitHub から取得して保存しているのは、この 3 つだけです。
+ほかの人に見せるかどうかは、3 つまとめて 1 つの設定で決めます。初期状態では公開していません。
+切り替えた結果は、次の表示からそのまま反映されます。
+</p>
+
+<table>
+<thead>
+<tr><th>項目</th><th>値</th></tr>
+</thead>
+<tbody>
+<tr><td>ユーザー ID</td><td>{{ settings.profile().account_id() }}</td></tr>
+<tr><td>アカウント名</td><td>{{ settings.profile().account_name() }}</td></tr>
+<tr><td>アバター画像の URL</td><td>{{ settings.profile().avatar_url() }}</td></tr>
+</tbody>
+</table>
+
+<dl>
+<dt>公開範囲</dt>
+<dd>
+{%- if settings.publishes_profile() -%}ほかの人にも公開
+{%- else -%}<span class="muted">自分だけ</span>
+{%- endif -%}
+</dd>
+</dl>
+
+<form method="post" action="/account/visibility">
+<input type="hidden" name="published" value="{% if settings.publishes_profile() %}false{% else %}true{% endif %}">
+<button type="submit">{% if settings.publishes_profile() %}自分だけにする{% else %}ほかの人にも公開する{% endif %}</button>
+</form>
+
+<p class="muted">
+公開していないあいだは、上の 3 つはほかの人が見るページのどこにも出しません。
+公開すると 3 つとも出て、この 3 つからあなたの GitHub のアカウントが分かります。
+サーバーが GitHub から取得して保存するのはこの 3 つだけです。メールアドレスやリポジトリの情報は取得しません。
+</p>
+
+<p><a href="/tokens">トークンのページ</a></p>
+
+{% if administers %}
+<h2>運営者向け</h2>
+<p class="muted">
+このアカウントはこのサーバーの運営者として設定されています。
+</p>
+<p><a href="/admin/ratings">指定レートのページ</a></p>
+{% endif %}
+
+<h2>サインアウト</h2>
+<p class="muted">
+このブラウザのセッションをサーバー側から消します。もう一度使うにはサインインし直してください。
+</p>
+<form method="post" action="/sign-out">
+<button type="submit">サインアウト</button>
+</form>
+{% endblock %}
