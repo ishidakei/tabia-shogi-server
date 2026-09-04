@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Row, SqlitePool};
+use sqlx::{ConnectOptions, Connection, Row, SqlitePool};
 
 use crate::auth::TokenHash;
 
@@ -68,8 +68,38 @@ impl Database {
         let options = SqliteConnectOptions::new()
             .filename(&path)
             .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal);
+
+        // The journal mode is not among those options, and the pool below is
+        // never asked for it, because switching a database into WAL is the one
+        // thing here that two connections must not attempt at once.
+        //
+        // The pool opens more than one connection at a time even though
+        // `MIN_CONNECTIONS` is one: `connect_with` and the maintenance task
+        // `sqlx` spawns alongside it both run `try_min_connections`, and each
+        // can pass its `size() < 1` check before the other increments, so a
+        // cold process routinely establishes two at once. On a database that
+        // is not yet in WAL, both then run `PRAGMA journal_mode = WAL`, which
+        // takes an exclusive lock that `sqlite3_busy_timeout` cannot wait on,
+        // and the loser fails the whole open with SQLITE_BUSY — "database is
+        // locked", on a file nothing else has ever touched. Measured at 22
+        // startups in 2000 before this, none in 2000 after.
+        //
+        // So the switch happens here, on one connection that is alone with the
+        // file. WAL is recorded in the database header rather than in the
+        // connection, so every connection the pool opens afterwards is in WAL
+        // without issuing the pragma at all.
+        let alone = options.clone().journal_mode(SqliteJournalMode::Wal);
+
+        let first = match alone.connect().await {
+            Ok(connection) => connection,
+            Err(source) => return Err(OpenError::Open { path, source }),
+        };
+
+        // Closed before the pool exists, so that the two never overlap. The
+        // error is dropped rather than reported: the mode is already written,
+        // and a close that failed is a connection the pool does not have.
+        let _ = first.close().await;
 
         // Three of `sqlx`'s defaults are turned off, all three because they
         // exist to manage connections to a server that can restart, fail over
