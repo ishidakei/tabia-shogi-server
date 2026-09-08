@@ -1882,6 +1882,30 @@ roundup = false
                 .await
                 .expect("the schema is there");
 
+            // Every connection the pool may hold, established and idle — not
+            // just the one. `sqlx` hands a connection back to the pool from a
+            // task of its own, so a query issued right after another can find
+            // the pool empty while that hand-back is still in flight, and the
+            // fresh connection it then opens is the wait the freeze cannot
+            // survive.
+            let pool = wired.task.proposal.database.pool();
+            let capacity = pool.options().get_max_connections() as usize;
+            let mut held = Vec::with_capacity(capacity);
+            for _ in 0..capacity {
+                held.push(pool.acquire().await.expect("the pool opens connections"));
+            }
+            drop(held);
+            // Back in the pool before the clock stops, since the hand-back is
+            // what the freeze cannot wait for. Bounded: a pool that never
+            // reaches capacity is a test that fails on its own assertion, not
+            // one that hangs here.
+            for _ in 0..10_000 {
+                if pool.num_idle() >= capacity {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+
             tokio::time::pause();
 
             wired
