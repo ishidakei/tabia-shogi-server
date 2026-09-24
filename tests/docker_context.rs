@@ -487,7 +487,7 @@ fn the_allow_list_screen_rejects_a_declared_path_the_context_excludes() {
 #[test]
 fn the_copy_screen_rejects_a_declared_path_no_builder_copy_takes() {
     let dockerfile = "\
-FROM rust:1.98.0-bookworm AS builder
+FROM rust:1.98.1-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src

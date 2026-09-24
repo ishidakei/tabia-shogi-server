@@ -2125,7 +2125,10 @@ mod tests {
                 .expect("it inserts");
         }
 
-        crate::services::rating::publish_once(
+        // Published at a fixed moment the day after the games, not at the wall
+        // clock: the recent table's two-week window is measured from the
+        // publication, so a clock read would age the games out of it.
+        crate::services::rating::publish_at(
             &harness.database,
             &crate::services::ScaleSource::of(
                 Vec::new(),
@@ -2134,6 +2137,8 @@ mod tests {
             ),
             &crate::services::Floodgate,
             &harness.publications,
+            crate::services::rating::Timestamp::parse("2026-08-28T12:00:00Z")
+                .expect("a valid timestamp"),
         )
         .await
         .expect("selectable");
