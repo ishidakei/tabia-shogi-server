@@ -2561,4 +2561,61 @@ roundup = false
             None
         );
     }
+
+    /// The committed main-event preset: 3 minutes for sente and 10 for gote,
+    /// a 2-second increment, truncation, no minimum charge and a 512-move cap.
+    const MAIN_EVENT: &str = include_str!("../../assets/config/main-event.toml");
+
+    #[test]
+    fn the_main_event_preset_is_its_clock_and_announces_it() {
+        let config = Config::parse(MAIN_EVENT).expect("the main-event preset is well formed");
+        let time = &config.time;
+
+        assert_eq!(time.unit, TimeUnit::Second);
+        assert_eq!(time.total, Duration::from_secs(600));
+        assert_eq!(time.increment, Some(Duration::from_secs(2)));
+        assert_eq!(time.least_time_per_move, Duration::ZERO);
+        assert!(!time.roundup, "thinking time is truncated, not rounded up");
+        assert_eq!(time.byoyomi, None);
+        let reduction = time.reduction.expect("sente's allowance is reduced");
+        assert_eq!(reduction.side, Color::Black);
+        assert_eq!(reduction.amount, Duration::from_secs(420));
+        assert_eq!(config.limit.map(|limit| limit.max_moves), Some(512));
+
+        // A hirate entry, so the reduction rides the fixed king shuttle.
+        let start = transmitted_start(&StartSpec::Buoy { setup: Vec::new() }, time);
+        let setup_times = setup_t_values(setup_len(&start), time);
+        let summary = GameSummary {
+            game_id: "20261023-tabia-1-0",
+            black_name: "sente",
+            white_name: "gote",
+            max_moves: config.limit.map(|limit| limit.max_moves),
+            time: time_settings(time),
+            start: &start,
+            setup_times: &setup_times,
+        };
+        let lines =
+            crate::csa::game_summary::encode(&summary, Color::Black).expect("the shuttle encodes");
+
+        for expected in [
+            "Max_Moves:512",
+            "Total_Time:600",
+            "Increment:2",
+            "Least_Time_Per_Move:0",
+            "Time_Roundup:NO",
+        ] {
+            assert!(
+                lines.iter().any(|line| line == expected),
+                "{expected} missing from {lines:?}"
+            );
+        }
+
+        // Black's first setup move carries the whole reduction plus the
+        // increment, which leaves sente 600 + 2 - 422 = 180 seconds; every
+        // other setup move carries the increment alone.
+        let setup: Vec<&String> = lines.iter().filter(|line| line.contains(",T")).collect();
+        assert_eq!(setup.len(), 4, "{lines:?}");
+        assert!(setup[0].starts_with('+') && setup[0].ends_with(",T422"));
+        assert!(setup[1..].iter().all(|line| line.ends_with(",T2")));
+    }
 }

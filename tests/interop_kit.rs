@@ -18,7 +18,8 @@ mod common;
 use tabia_shogi_server::Startup;
 
 use common::interop::{
-    COLLECTION, INTEROP_MINIMUM_PLIES, LONG, SHORT, collection, config, entry, setup_len,
+    COLLECTION, INTEROP_MINIMUM_PLIES, LONG, MAIN_EVENT_CONFIG, SHORT, collection, config,
+    config_of, entry, setup_len,
 };
 
 #[cfg_attr(miri, ignore)]
@@ -89,5 +90,25 @@ async fn the_interop_configuration_is_valid_against_the_interop_collection() {
         .expect("the committed pair starts a server");
 
     // Starting creates both storage paths, and the temp area is not the tree.
+    let _ = std::fs::remove_dir_all(&records);
+}
+
+#[cfg_attr(miri, ignore)]
+#[tokio::test]
+async fn the_main_event_preset_starts_against_the_interop_collection() {
+    // The reduction rides sente's first setup move, so every entry the preset
+    // serves has to give sente one; startup validation is what asks.
+    let config = config_of(MAIN_EVENT_CONFIG);
+    let records = config.records.clone();
+
+    assert_eq!(format!("{:?}", config.auth_mode), "Open");
+    assert!(config.csa.tls.is_none());
+    assert_eq!(config.positions.to_string_lossy(), COLLECTION);
+    assert!(config.time.reduction.is_some());
+
+    Startup::new(config, collection())
+        .await
+        .expect("the preset and the interop collection start a server");
+
     let _ = std::fs::remove_dir_all(&records);
 }

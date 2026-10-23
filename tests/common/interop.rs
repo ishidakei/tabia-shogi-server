@@ -16,6 +16,10 @@ pub const COLLECTION: &str = "assets/positions/interop.txt";
 /// The committed configuration the check is run under.
 pub const CONFIG: &str = "assets/config/interop.toml";
 
+/// The committed preset carrying the main event's clock, served from the same
+/// collection.
+pub const MAIN_EVENT_CONFIG: &str = "assets/config/main-event.toml";
+
 /// The check's own requirement — a setup sequence of at least twenty plies — as
 /// a number a test can count.
 pub const INTEROP_MINIMUM_PLIES: usize = 20;
@@ -55,16 +59,26 @@ pub const COMMITTED_DATABASE: &str = "database = \"tabia.sqlite3\"";
 /// committed file's own, and the ones a test cannot inherit are exactly those
 /// that would write to the tree or take a fixed port.
 pub fn config() -> Config {
-    Config::parse(&config_text()).unwrap_or_else(|error| panic!("{CONFIG}: {error}"))
+    config_of(CONFIG)
+}
+
+/// Another committed configuration, parsed the same way.
+pub fn config_of(path: &str) -> Config {
+    Config::parse(&config_text_of(path)).unwrap_or_else(|error| panic!("{path}: {error}"))
 }
 
 /// The committed configuration's text, with both storage paths redirected.
 pub fn config_text() -> String {
-    let text = fs::read_to_string(CONFIG).unwrap_or_else(|error| panic!("{CONFIG}: {error}"));
+    config_text_of(CONFIG)
+}
+
+/// A committed configuration's text, with both storage paths redirected.
+pub fn config_text_of(path: &str) -> String {
+    let text = fs::read_to_string(path).unwrap_or_else(|error| panic!("{path}: {error}"));
     for committed in [COMMITTED_RECORDS, COMMITTED_DATABASE] {
         assert!(
             text.contains(committed),
-            "{CONFIG} no longer names {committed}, so this redirection silently did nothing",
+            "{path} no longer names {committed}, so this redirection silently did nothing",
         );
     }
 
