@@ -2562,13 +2562,16 @@ roundup = false
         );
     }
 
-    /// The committed main-event preset: 3 minutes for sente and 10 for gote,
-    /// a 2-second increment, truncation, no minimum charge and a 512-move cap.
-    const MAIN_EVENT: &str = include_str!("../../assets/config/main-event.toml");
+    /// The shipped Denryu-sen main-event configuration: 3 minutes for sente and
+    /// 10 for gote, a 2-second increment, truncation, no minimum charge and a
+    /// 512-move cap.
+    const DENRYU_SEN_MAIN_EVENT: &str =
+        include_str!("../../assets/config/denryu-sen-main-event.toml");
 
     #[test]
-    fn the_main_event_preset_is_its_clock_and_announces_it() {
-        let config = Config::parse(MAIN_EVENT).expect("the main-event preset is well formed");
+    fn the_denryu_sen_main_event_file_is_its_clock_and_announces_it() {
+        let config = Config::parse(DENRYU_SEN_MAIN_EVENT)
+            .expect("the Denryu-sen main-event file is well formed");
         let time = &config.time;
 
         assert_eq!(time.unit, TimeUnit::Second);

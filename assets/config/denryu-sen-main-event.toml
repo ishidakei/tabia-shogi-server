@@ -1,0 +1,48 @@
+# The Denryu-sen main event, written with this server's own keys: sente 3
+# minutes and gote 10 minutes, a 2-second increment for both, each move's
+# thinking time truncated to whole seconds with no minimum charge, and a draw
+# once move 512 is reached undecided.
+#
+# Every game starts from the plain starting position (assets/positions/hirate.txt
+# holds that one entry). Both allowances start at 600 seconds, and sente's is
+# reduced to 180 through a consumed time, as the tournament does it: the server
+# plays four king moves before the first real one and sends them in the
+# Game_Summary's Position block,
+#
+#   +5958OU,T422
+#   -5152OU,T2
+#   +5859OU,T2
+#   -5251OU,T2
+#
+# A T-value is the time deducted, so each T2 cancels the 2-second increment and
+# sente's T422 deducts the 420-second reduction on top. Play begins at move 5,
+# sente to move, from the starting position again, with sente at 180 seconds
+# and gote at 600. The four moves are moves 1 to 4 of the record and count
+# towards max_moves; an engine whose opening book is keyed by move number has
+# to allow for them, as at the tournament itself.
+auth_mode = "open"
+positions = "assets/positions/hirate.txt"
+records = "records"
+database = "tabia.sqlite3"
+
+[limit]
+max_moves = 512
+min_playable_plies = 40
+
+[matchmaking]
+idle_delay_seconds = 0
+interval_seconds = 1
+
+[csa]
+host = "0.0.0.0"
+port = 4081
+max_malformed_lines = 8
+agreement_timeout_seconds = 120
+
+[time]
+time_unit = "1sec"
+total = 600
+increment = 2
+least_time_per_move = 0
+roundup = false
+reduction = { side = "black", amount = 420 }

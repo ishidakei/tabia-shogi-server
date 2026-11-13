@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 pub mod interop;
+pub mod log;
 
 use std::fmt;
 use std::net::SocketAddr;

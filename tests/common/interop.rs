@@ -16,10 +16,6 @@ pub const COLLECTION: &str = "assets/positions/interop.txt";
 /// The committed configuration the check is run under.
 pub const CONFIG: &str = "assets/config/interop.toml";
 
-/// The committed preset carrying the main event's clock, served from the same
-/// collection.
-pub const MAIN_EVENT_CONFIG: &str = "assets/config/main-event.toml";
-
 /// The check's own requirement — a setup sequence of at least twenty plies — as
 /// a number a test can count.
 pub const INTEROP_MINIMUM_PLIES: usize = 20;
