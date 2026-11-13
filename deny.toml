@@ -23,10 +23,22 @@ all-features = true
 # same way.
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-# Empty by design. An entry here silences one advisory id, and every one of
-# them needs a comment saying who accepted the risk and why — an unexplained
-# ignore is how a known vulnerability becomes permanent.
-ignore = []
+# An entry here silences one advisory id, and every one of them needs a comment
+# saying who accepted the risk and why — an unexplained ignore is how a known
+# vulnerability becomes permanent.
+ignore = [
+    # SQLite before 3.54.0 can return uninitialized page-cache memory when it
+    # opens a database together with a crafted `-wal` file whose page size
+    # differs. The bundled SQLite in `libsqlite3-sys` is patched from 0.39.0,
+    # but no released `sqlx` can take it: `sqlx-sqlite` 0.8.6 requires
+    # `^0.30.1` and 0.9.0 requires `>=0.30.1, <0.38.0`. The only database this
+    # server opens is the one file at its own `database` configuration path,
+    # which it creates and alone writes; a party that could plant a `-wal`
+    # beside it could already rewrite the database itself, so the attack buys
+    # nothing here. Remove this entry once a `sqlx` release accepts
+    # `libsqlite3-sys` 0.39 and `cargo update` brings it in.
+    { id = "RUSTSEC-2026-0459", reason = "no sqlx release accepts the patched libsqlite3-sys; the server opens only its own database file" },
+]
 
 [licenses]
 # Enumerated from the actual dependency tree (`cargo deny --all-features list`),

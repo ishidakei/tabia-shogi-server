@@ -2125,9 +2125,17 @@ mod tests {
                 .expect("it inserts");
         }
 
-        // Published at a fixed moment the day after the games, not at the wall
-        // clock: the recent table's two-week window is measured from the
-        // publication, so a clock read would age the games out of it.
+        publish_the_day_after(harness).await;
+    }
+
+    /// Makes a publication through the production path, at a fixed moment the
+    /// day after the games these tests give `row` ended.
+    ///
+    /// Not at the wall clock: a game's weight decays from the publication
+    /// moment and the recent table's two-week window is measured from it, so a
+    /// clock read would age the dated games off both tables as the calendar
+    /// moves on.
+    async fn publish_the_day_after(harness: &Harness) {
         crate::services::rating::publish_at(
             &harness.database,
             &crate::services::ScaleSource::of(
@@ -2272,18 +2280,7 @@ mod tests {
                 .await
                 .expect("it inserts");
         }
-        crate::services::rating::publish_once(
-            &harness.database,
-            &crate::services::ScaleSource::of(
-                Vec::new(),
-                crate::services::Scale::DEFAULT_FALLBACK,
-                crate::storage::Designations::of(&harness.database),
-            ),
-            &crate::services::Floodgate,
-            &harness.publications,
-        )
-        .await
-        .expect("selectable");
+        publish_the_day_after(&harness).await;
 
         // Nothing published: the name is not on the table, and the page is
         // still served to a visitor with no account at all.
@@ -2344,18 +2341,7 @@ mod tests {
             before.body
         );
 
-        crate::services::rating::publish_once(
-            &harness.database,
-            &crate::services::ScaleSource::of(
-                Vec::new(),
-                crate::services::Scale::DEFAULT_FALLBACK,
-                crate::storage::Designations::of(&harness.database),
-            ),
-            &crate::services::Floodgate,
-            &harness.publications,
-        )
-        .await
-        .expect("selectable");
+        publish_the_day_after(&harness).await;
 
         let after = harness.get_as(ACCOUNT, "/tokens").await;
         // An even record over one group, on the fallback baseline this scale
@@ -2381,18 +2367,7 @@ mod tests {
                 .await
                 .expect("it inserts");
         }
-        crate::services::rating::publish_once(
-            &harness.database,
-            &crate::services::ScaleSource::of(
-                Vec::new(),
-                crate::services::Scale::DEFAULT_FALLBACK,
-                crate::storage::Designations::of(&harness.database),
-            ),
-            &crate::services::Floodgate,
-            &harness.publications,
-        )
-        .await
-        .expect("selectable");
+        publish_the_day_after(&harness).await;
 
         let answer = harness.get("/ratings").await;
 
